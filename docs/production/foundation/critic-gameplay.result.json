@@ -1,0 +1,227 @@
+{
+ "gaps": [
+  {
+   "severity": "blocker",
+   "area": "enemies/boss - staged death lifecycle",
+   "problem": "EnemyKind life cycle is onKilled -> 'enemy:killed' -> onDespawn -> slot freed, and killAll says 'free its slot immediately'. The Conductor needs ~5 s (tuning.deathSeconds) of staged death with its actor, meshes and update still alive, and EnemySystem.boss must stay non-null 'in its staged death'. There is no dying state, no update hook after hp 0, and no rule for which clock the staging uses (it runs slow motion itself, while the director waits sequenceSeconds UNSCALED).",
+   "proposedChange": "EnemyBehavior: `onKilled(info: Readonly<DamageInfo>): number | void` (return seconds to stay in the scene as a corpse) and `updateDying?(dt: number, unscaledDt: number): void` called every substep while dying. EnemyHandle: `readonly dying: boolean`. Manager on death: alive=false, HitTarget unregistered, tokens released, emits events, keeps the actor until the timer (counted in ctx.time.unscaledDt) ends, then onDespawn. Dying actors are excluded from aliveCount/waveCount/list-based queries (nearest/queryRadius) but `boss` still returns the handle. killAll(true) frees dying actors too. 'boss:defeated'.sequenceSeconds = the value returned by onKilled."
+  },
+  {
+   "severity": "blocker",
+   "area": "enemies/boss - phase state",
+   "problem": "BossHandle has phase/phaseCount/invulnerable/name but EnemyActor (all a kind receives) only extends EnemyHandle, so the boss kind cannot set its phase or invulnerability, and nothing says who emits 'boss:phase' ('E: enemies'). The stub manager derives phase from hp thresholds, which cannot express the 2.5 s invulnerable phase shift or stop one 2000-damage hit from skipping phase 2.",
+   "proposedChange": "EnemyActor adds mutable `phase: number; phaseCount: number; invulnerable: boolean; name: string`. EnemySystem adds `setBossPhase(enemyId: number, phase: number): void` (writes actor.phase, emits 'boss:phase'; the BOSS KIND calls it, the manager never derives phases). Manager rule: while actor.invulnerable every hit returns {dealt 0, absorbed true}. Doc: the boss clamps damage at a threshold in filterDamage (`Math.min(base, actor.hp - actor.maxHp * tuning.phase2)`)."
+  },
+  {
+   "severity": "major",
+   "area": "enemies - self kill / despawn",
+   "problem": "A kind has no way to kill or remove its own actor: the tick must die when it detonates at 2.2 m (combat.explode never damages an enemy owner), summons may need to expire, and enemies knocked outside world.bounds / below killY need culling ('may be culled' - by whom?). hp/alive are documented as manager-owned.",
+   "proposedChange": "EnemySystem: `kill(enemyId: number, opts?: { silent?: boolean; creditPlayer?: boolean; type?: DamageType }): boolean` (normal death path: onKilled, 'enemy:killed' with byPlayer = creditPlayer, score 0 unless creditPlayer). Manager duty: every update, kill({silent:false}) any actor outside ctx.world.bounds or below world.killY, or whose position is non-finite (silent)."
+  },
+  {
+   "severity": "major",
+   "area": "enemies/combat - shields and weak points",
+   "problem": "filterDamage returns only the final hp damage, so the manager cannot fill DamageResult.shieldDamage/absorbed/part: bulwark shield hits show '0', 'hit:confirmed'.shield and the hitShield feedback cannot be driven, and the kind cannot remap part (arc-based frontal shield where combat reports 'body'). The boss also cannot tell WHICH capacitor was struck (DamageInfo carries only HitPart) so per-weak-point hp / 'bossWeakPointBreak' needs a nearest-sphere hack.",
+   "proposedChange": "`filterDamage?(info: Readonly<DamageInfo>, baseDamage: number, result: DamageResult): number` - the kind may set result.part, result.shieldDamage, result.absorbed; manager then sets dealt = hp damage + shieldDamage. Add `sphereIndex: number` to ShotHit and DamageInfo (index into HitTarget.spheres, -1 for splash/unknown; set by traceShot/tracePierce/projectile hits; makeDamageInfo/clearDamageInfo default -1). Combat picks hit fx/sound from `result.part`, not info.part."
+  },
+  {
+   "severity": "major",
+   "area": "enemies - movement ownership",
+   "problem": "Three things are double-owned or unowned: (1) EnemySystem doc lists 'separation' as a manager update step AND offers separation() to kinds (stub applies both); (2) 'Applies ctx.mods.enemySpeedMul at spawn' but kinds own movement and read def.speed (stub kind multiplies itself); (3) knock is decayed by the manager but integrated by kinds with no clamp - a 9-pellet breaker blast is 9 x 4.5 = 40 m/s on a mass-1 skitter, pushing ground units through walls / off the nav grid. Six kinds would each write their own integrator (moveAndSlide brute force vs nav clamp).",
+   "proposedChange": "EnemyActor adds `speed: number` (def.speed * enemySpeedMul, set by the manager at spawn; kinds never read the modifier). EnemySystem adds `moveGround(actor: EnemyActor, desiredVelocity: Vec3Like, dt: number): void` (adds knock + separation, clamps to walkable step-connected nav cells via nav.isLineWalkable with axis sliding, damps y to nav.heightAt, writes position/velocity) and `moveFlying(actor: EnemyActor, desiredVelocity: Vec3Like, dt: number, minAltitude: number): void` (knock + separation + overlapSphere(COL.ENEMY) avoidance + world.bounds clamp). Manager clamps |knock| <= 12 m/s and sums knockback per substep; manager.update no longer moves positions itself. separation() stays as the raw query."
+  },
+  {
+   "severity": "major",
+   "area": "enemies - plug-in conventions for parallel work",
+   "problem": "Kinds are meant to be written independently but the contract does not fix module paths/export names, who writes aimPoint/zone, or what a kind must do when the player is dead / mode is gameover|victory ('Enemies never attack while !ctx.player.alive' - manager or kind?). Stub switches to animate() outside 'playing' but not during the 1.5 s death delay; telegraphs/lasers mid-attack are left hanging.",
+   "proposedChange": "Doc: each kind lives in `src/enemies/kinds/<type>.ts` and exports `export const <type>Kind: EnemyKind` (skitterKind ... conductorKind); shared helpers are ONLY the EnemySystem services. Kind writes actor.aimPoint, velocity, yaw, root transform and sphere centres in onSpawn AND every update/animate; manager writes zone, age, stun, knock decay. EnemySystem adds `readonly canAttack: boolean` (player.alive && mode === 'playing' && !debug.freezeAi) - kinds must check it before starting a telegraph and before applying damage, and cancel running telegraphs/beams when it turns false. Add `hasLineOfSight(enemyId: number): boolean` (manager-cached per enemy, refreshed at most every 0.15 s, staggered; aimPoint -> player.center with COL.SIGHT)."
+  },
+  {
+   "severity": "major",
+   "area": "combat/director - kill credit for chain reactions",
+   "problem": "byPlayer = info.faction === 'player'. A tick shot by the player explodes with faction 'enemy' + friendlyFire, so every chain-reaction kill is byPlayer=false: no score, combo, Overclock charge, lifeOnKill or explosive-crit. The brief sells tick chain reactions as a player tool. Also undefined: do neutral/enemy-credited kills count in stats.kills and roll drops.",
+   "proposedChange": "Add `creditPlayer?: boolean` to ExplosionOptions and ProjectileOptions, and `creditPlayer: boolean` to DamageInfo (default false; combat copies it). 'enemy:killed'.byPlayer = info.faction === 'player' || info.creditPlayer. Tick.onKilled passes `creditPlayer: info.faction === 'player' || info.creditPlayer`. 'hit:confirmed' still only for faction 'player'. Director rule: score/combo/multikill only when byPlayer; stats.kills and pickup drops for every non-silent kill."
+  },
+  {
+   "severity": "major",
+   "area": "combat - hit feedback granularity",
+   "problem": "applyDamage plays the hit sound, damage number and 'hit:confirmed' per call. A breaker blast is 9 applyDamage calls in one frame on one target (plus chain arcs): 9 hit sounds, 9 stacked numbers, 9 hitmarker events, and killed=true can be followed by more events for the same corpse-frame.",
+   "proposedChange": "Contract: combat accumulates player->enemy feedback per target during the substep and flushes ONCE per target at the start of combat.update (same substep as weapons.update): one 'hit:confirmed' { amount: sum, crit: any, killed: any, shield: all absorbed, part: best of weak>body>armor>shield, point: last }, one damage number, one sound (hitKill > hitCrit > hitShield > hitArmor > hitConfirm). Hit sparks stay per ray. Add `DamageNumberOptions.targetId?: number` so fx can merge numbers on one target across frames."
+  },
+  {
+   "severity": "major",
+   "area": "combat - explosion timing / re-entrancy",
+   "problem": "explode() is immediate unless a damage call or blast is in flight. Called from an enemy kind's update (tick, bulwark stomp, boss) it kills other enemies in the middle of the manager's iteration, and results differ depending on who called from where. Immediate-vs-queued also makes ordering non-deterministic for tests.",
+   "proposedChange": "Make it unconditional: `explode()` ALWAYS enqueues (opts copied into a pooled record); combat.update resolves the queue first, in FIFO order, including blasts enqueued while resolving (cap 32 per update, remainder next substep). Visual/sound play at resolve time. reset() and clearProjectiles() do not run queued blasts. Document distance rule: d = max(0, |pos - target.center| - target.boundRadius), damage = lerp(damage, damage*edgeFalloff, d/radius)."
+  },
+  {
+   "severity": "major",
+   "area": "time scale - Overclock vs player-owned projectiles",
+   "problem": "combat.update(dt) uses scaled world time, so during Overclock the player's own rockets fly at 18 m/s (slower than a 24 m/s dash, barely faster than sprint) and grenade fuses take 4 s: the player outruns and eats their own ordnance, contradicting 'the player moves, aims and shoots at full speed'.",
+   "proposedChange": "ProjectileOptions adds `clock?: 'world' | 'player'` (default 'player' when faction === 'player', else 'world'); combat advances 'player' projectiles (motion, fuse, lifetime, homing) with ctx.time.unscaledDt and the rest with dt. Same default for the trail emission rate. Doc the director's clocks explicitly: combo window, multikill window, pickup lifetime and wave timers use scaled dt; death delay and boss sequenceSeconds use unscaledDt."
+  },
+  {
+   "severity": "major",
+   "area": "audio/time - global pitch follows time.scale",
+   "problem": "Audio applies a global SFX pitch/low-pass from ctx.time.scale with only music and UI exempt. So during Overclock the player's own gun, reload and dash sounds drop to 0.4 pitch; and 'perkAcquire' (director, SFX) is played while scale is still 0. Separately time.ts sets `scale = 0` whenever not simulating, so while paused/boot every reader sees 0 and audio would pitch everything to zero.",
+   "proposedChange": "SoundOptions and LoopOptions add `timeScaled?: boolean`; default false for play() (2D: player weapons, hurt, stingers, director sounds), true for playAt() and positional loops. core/time.ts advance(): `const scale = effective(); mutable.scale = scale; mutable.dt = simulating ? stepDt * scale : 0; mutable.unscaledDt = playing && scale > 0 ? stepDt : 0;` (scale keeps its effective value while paused; dt is still 0). Audio mutes by ctx.game.mode, never by scale === 0."
+  },
+  {
+   "severity": "major",
+   "area": "feedback ownership - ids with two or zero owners",
+   "problem": "Several ids contradict the ownership rule and will double-fire or stay silent: (a) 'boltFire'/'mortarLaunch'/'missileLaunch' 'played by combat' vs riveterAttack/waspAttack/bulwarkAttack/conductorVolley/conductorMissile/hornetFire played by the shooter; (b) fx+sound 'grenadeBounce' listed under weapons but only combat sees the bounce; (c) fx 'hitPlayer'/'hitPlayerShield' listed 'spawned by combat' but player owns hurt feedback; (d) sound 'lifeSteal' + 'chainZap' listed under director, applied by player / weapons; (e) 'uiCountdown'/'uiCountdownGo' (ui) vs 'intermissionTick'/'intermissionEnd' (director); (f) 'uiPerkSelect' (ui) vs 'perkAcquire' (director) on the same pick; (g) 'gameOver'/'victory' (director) vs audio's automatic defeat/victory music stingers; (h) 'fallRespawn' listed under player, moment owned by world; (i) 'bulletWhiz', 'explosionDistant' unowned.",
+   "proposedChange": "Fix the table in types.ts: combat plays NO launch sounds (delete 'boltFire','mortarLaunch','missileLaunch'; keep fly loops, 'mortarWhistle', impacts); combat owns 'grenadeBounce' fx+sound, 'bulletWhiz' (enemy projectile passing < 2 m from player.eye) and 'explosionDistant' (blast > 40 m away instead of the near sound); PLAYER.takeDamage spawns 'hitPlayer'/'hitPlayerShield'; player owns 'lifeSteal' fx+sound; weapons own 'chainArc'+'chainZap'; director owns countdown ticks (delete 'uiCountdown','uiCountdownGo'); director plays 'perkAcquire' in choosePerk and UI never plays a sound on pick (delete 'uiPerkSelect'); delete 'gameOver'/'victory' one-shots (audio music owns them on 'run:end'); UI plays 'newBest' on 'run:end'; world plays 'fallRespawn'."
+  },
+  {
+   "severity": "major",
+   "area": "weapons/render - viewmodel space to world space",
+   "problem": "Viewmodels live in ctx.viewScene with a fixed 58 deg viewCamera while the world camera is 78 deg hip and changes with ADS. Tracers, world-space muzzle fx, casings, rail beams and rocket spawn points need the muzzle's WORLD position that lines up on screen with the barrel; a naive camera.matrixWorld transform is visibly offset and every engineer would derive a different mapping. Nothing says who may change viewCamera.fov.",
+   "proposedChange": "RenderSystem adds `viewToWorld(viewPoint: Vec3Like, out: THREE.Vector3): THREE.Vector3` = ctx.camera.matrixWorld applied to (x*k, y*k, z) with k = tan(camera.fov/2)/tan(viewCamera.fov/2), using the camera matrices of the current substep. Doc: weapons trace from player.getAimRay but draw tracers/beams/muzzle fx from viewToWorld(muzzle); projectiles spawn at eye + forward*0.6 with the visual trail starting at the muzzle. viewCamera.fov is fixed at 58 and written by nobody (weapons animate ADS by moving the model)."
+  },
+  {
+   "severity": "major",
+   "area": "director/core - perk select input and the frozen clock",
+   "problem": "perk1..3 share bindings with weapon1..3 (Digit1-3), reload/weaponNext/crouch (pad X/Y/B) and overclock/uiLeft/uiRight (D-pad). A player tapping reload or a weapon key as the offer appears picks a perk blind. The director cannot time a guard: in the hard freeze it gets update(0), and game.ts calls it once PER SUBSTEP (up to 3x per frame) so summing ctx.time.realDt triple-counts. Unspecified whether choosePerk() itself is guarded (bot default perkDelay 0.4, campaign uses 0.25).",
+   "proposedChange": "Doc on DirectorSystem: 'perk1..3 actions are ignored until ctx.time.elapsed - offeredAt >= 0.6 s; choosePerk(index) (UI click, bot, debug) is never time-guarded. Freeze-time timers use ctx.time.elapsed timestamps, never an accumulated dt.' Add `readonly perkOfferedAt: number` (ctx.time.elapsed of the offer, 0 if none) so the UI can animate its input-lock bar. core/game.ts: in the hard-freeze branch call director.update(0) only when i === 0."
+  },
+  {
+   "severity": "major",
+   "area": "director - death during clear / perk offer",
+   "problem": "If the player dies on the frame the last enemy dies (tick blast), the wave clears, the perk offer hard-freezes the world for a dead player, and the death timer (unscaled, 0 while frozen) never runs; the stub returns from the perkSelect branch before the end timer. The run soft-locks on a perk screen behind a dead camera. Same hazard for supplyDrop.",
+   "proposedChange": "Contract: once 'player:died' fired (or an end is pending) the director stops its phase machine - no wave clear, supply, perk offer, intermission or spawns - clears a pending perk offer (time.clearScale('perkSelect'), perkOffer = null) and only counts DEATH_DELAY_SECONDS in unscaledDt to endRun(false). perkOffer with fewer than 1 available perk skips perkSelect entirely; fewer than 3 offers what exists."
+  },
+  {
+   "severity": "major",
+   "area": "director/boss - ammo and stall guarantees",
+   "problem": "The boss has dropChance 0 and 9000-12600 hp; total carried ammo at full reserves is roughly 18k damage before misses/falloff, and a hovering boss cannot be meleed. Whether SUMMONED enemies roll drops or score is unspecified. The campaign bot (and a human) can run dry with no way to finish. Regular waves can also stall on one unreachable/stuck enemy; the only anti-stall rule in the contract is the supply-crate timeout.",
+   "proposedChange": "DirectorSystem doc: (1) summoned kills roll drops normally and score at 25 %, no wave-clear accounting; (2) mercy drop: while phase is 'combat'|'boss', if every unlocked weapon has reserve + mag below 20 % of capacity and no 'ammo' pickup is live, spawn one 'ammo' pickup on a walkable point 6-12 m from the player, at most every 12 s; (3) straggler watchdog: in 'combat' with nothing left to spawn, if no wave enemy was damaged or killed for 40 s, enemies.kill() those with nav.flowDistance === Infinity or farther than 80 m and relocate nothing else. Add `EnemySpawnOptions.noDrops?: boolean` and expose `EnemyHandle.summoned` (exists) for the 25 % rule."
+  },
+  {
+   "severity": "major",
+   "area": "enemies/combat/player - after the run ends",
+   "problem": "In 'victory' (player alive) and 'gameover' core keeps running enemies.update + combat.update. Nothing stops live summons and in-flight projectiles from damaging the player on the victory screen ('player:died' in victory mode, hurt sounds over the stinger). Nobody is assigned to remove the boss's summons and projectiles when it dies.",
+   "proposedChange": "Contract: (1) PlayerSystem.takeDamage returns absorbed when ctx.game.mode !== 'playing'; (2) on boss death (inside the manager, before emitting 'boss:defeated') ENEMIES calls kill() on every other live enemy with {creditPlayer:false} staggered over 0.6 s and ctx.combat.clearProjectiles('enemy'); (3) in gameover/victory the manager calls only animate()/updateDying() (canAttack false); (4) combat.clearProjectiles('enemy') is also called by the director at 'wave:clear'."
+  },
+  {
+   "severity": "major",
+   "area": "player/director - levels and loops that outlive their owner",
+   "problem": "LEVEL post params and audio.setMuffle are 'written every frame by the owner', but player.update stops in gameover/victory and during the hard freeze: post.overclock/dashBlur/lowHealth and the muffle stay at their last value, so the defeat stinger and menu-bound screens are low-passed and desaturated until the next reset; heartbeatLoop/overclockLoop/slideLoop/lanceChargeLoop keep playing. post.saturation has two writers (director death cam, boss staging) with enemies updating before director - the director's per-frame write clobbers the boss.",
+   "proposedChange": "Rule in types.ts: 'a LEVEL owner writes only while its effect is active and writes the default exactly once when it ends'. PlayerSystem and WeaponSystem must implement `onModeChange(mode, prev)`: when mode is not 'playing'|'paused' -> post.overclock = post.dashBlur = post.adsVignette = 0, audio.setMuffle(0), stop their loops, time.clearScale('overclock'), player.setAds(0,1,1). Split ownership: post.saturation = director only (death cam), post.exposure + post.flash = boss staging only."
+  },
+  {
+   "severity": "major",
+   "area": "pause - who silences gameplay audio",
+   "problem": "While paused audio.update keeps running and every gameplay loop (enemy hovers, rocket loops, lancer laser, heartbeat, Overclock) keeps sounding; one-shots with `delay` still fire. No system is assigned to stop or suspend them, so either 8 systems each stop/restart their loops on onModeChange (and lose handles) or nobody does.",
+   "proposedChange": "AudioSystem doc: 'On game:mode paused audio suspends the SFX bus (one-shots, loops, pending delays) with a 60 ms fade and resumes it on leaving paused; UI sounds and music (ducked) continue. During the perk-select hard freeze (time.scale === 0 while playing) audio fades timeScaled voices to silence and restores them after. Gameplay systems never stop loops for pause or freeze.'"
+  },
+  {
+   "severity": "major",
+   "area": "render - shader warm-up for pooled objects",
+   "problem": "render.init() ('precompile') runs second in lifecycle order, before combat/player/weapons/enemies/director create their meshes, and renderer.compile skips invisible (pooled, hidden) objects. First spawn of each enemy type, projectile kind, pickup and weapon viewmodel compiles shaders mid-fight - a visible hitch exactly at wave start / weapon unlock.",
+   "proposedChange": "RenderSystem adds `warm(object: THREE.Object3D, layer?: 'world' | 'view'): void` - compiles the materials of a (hidden or detached) object against the matching scene's lights/fog; callable from any init() after render. Contract: enemies (one actor per kind), weapons (4 viewmodels), combat (one mesh per ProjectileKind), director (pickups, crate) and fx call it in init(). Core calls `ctx.render.warm(ctx.scene)` once after the last init."
+  },
+  {
+   "severity": "major",
+   "area": "core/game.ts - error containment granularity",
+   "problem": "contain() escalates to fatal after 3 consecutive throws of the same key. One enemy behaviour (or one projectile) that throws every frame makes 'update:enemies' fail 3 frames in a row = fatal panel within 50 ms, and the rest of that update (all other enemies) is skipped each time. 'It just works' needs the fault isolated to the entity.",
+   "proposedChange": "Contract for the enemy manager (and combat's projectile loop): wrap each behaviour call (onSpawn/update/animate/filterDamage/onDamaged/onKilled/updateDying/onDespawn) in try/catch -> `ctx.game.reportError('enemy:' + type, error)` and silently free that actor (kill({silent:true})); never rethrow. game.ts: raise CONSECUTIVE_FAILURES_FATAL to 10 and make reportError(non-fatal) count toward TOTAL_FAILURES_FATAL per source."
+  },
+  {
+   "severity": "major",
+   "area": "core/bot.ts - weapon handling",
+   "problem": "(1) wantFire is recomputed from `aimed` every frame, so on the LANCE (charge 0.6 s, release-cancels) any aim flicker cancels the charge and it rarely fires. (2) Semi weapons get one press per 1.15 s cycle (breaker 75 rpm, hornet 80 rpm run at 52). (3) Hornet is fired at point-blank range (self damage without god). (4) With every weapon empty vs a flying enemy/boss the bot only walks; campaign 'assist' then masks a design stall. (5) It beelines to pickups it cannot collect (full health).",
+   "proposedChange": "bot.ts: `if (weapon.def.trigger === 'charge') { if (weapon.charge > 0) wantFire = dist < range && !weapon.reloading; }` (latch until the shot releases); for 'semi' use `input.pressVirtual('fire')` whenever aimed and an own timer >= 60 / (def.rpm * ctx.mods.fireRateMul) + 0.03 instead of the hold cycle; skip/switch away from a weapon with def.splashRadius > 0 when dist < def.splashRadius + 2; filter pickups: skip 'health' when player.hp >= player.maxHp, 'shield' when full, 'grenade' when weapons.grenades >= grenadeCap, 'ammo' when every unlocked reserve is full. Stall (4) is fixed by the director mercy drop."
+  },
+  {
+   "severity": "major",
+   "area": "boss/fx - driven ground rings",
+   "problem": "Shock rings (ringSpeed 11 m/s, jump over) and the bulwark stomp need a ground ring whose radius gameplay drives so the visual equals the damage front. TelegraphOptions only describes a fill that grows to a fixed radius over `seconds` and then disappears; fx.spawn('bossShockRing'/'shockwaveRing') are one-shots with their own built-in speed. Engineers will ship a ring that visibly disagrees with the hit test.",
+   "proposedChange": "TelegraphOptions: `seconds: number` where 0 = persistent until cancel(); TelegraphKind 'shock' = a thin bright outline drawn exactly at `radius` with no fill, moved by TelegraphHandle.setRadius() every frame. Add `TelegraphHandle.setProgress(value: number): void` (0..1 fill for attacks whose timing can change). Doc: boss ring hit test = |distXZ(player.position, centre) - radius| < 0.6 && player.position.y - floorY < tuning.ringHeight; sweep laser test = segment vs player AABB using player.position, halfWidth, height."
+  },
+  {
+   "severity": "minor",
+   "area": "player - impulses",
+   "problem": "The melee 'small lunge' (MELEE.lunge 5 m/s) and ground knockback can only go through launch(velocity, additive), which 'Leaves the ground': the player loses step-up/snap, gets a fake landing event and footstep gap on every melee and every hit.",
+   "proposedChange": "PlayerSystem adds `addImpulse(velocity: Vec3Like): void` - adds to velocity; stays grounded when velocity.y <= 0.5, decays through normal ground friction. launch() keeps its 'leaves the ground' meaning for jump pads / blasts. takeDamage uses addImpulse(dir * knockback * 0.5) (player mass 2) and applies no knockback while invulnerable."
+  },
+  {
+   "severity": "minor",
+   "area": "player - perk and Overclock rules left to guesswork",
+   "problem": "lastStandCharges 'from ctx.mods.lastStand' - a perk taken mid-run must count, the stub caches at reset. maxShield perk: nobody tops up the shield. Overclock charge 'scaled up with the combo multiplier' has no formula, no rule for gain while active, and the player's 'enemy:killed' handler runs before the director's (init order) so it reads the pre-kill multiplier. addShield does not say whether it emits 'player:healed'.",
+   "proposedChange": "Doc: `lastStandCharges = max(0, ctx.mods.lastStand - usedThisRun)`. Director in choosePerk: maxHealth -> player.heal(Infinity); maxShield -> player.addShield(25); grenadier -> weapons.addGrenades(1); dashCharge handled by player (new charge arrives full). Overclock points per kill = def.overclockCharge * (crit ? 1.5 : 1) * (1 + 0.1 * (director.combo.multiplier - 1)), read before the director updates the combo; no gain while overclock.active; boss damage grants 1 point per 150 damage via 'hit:confirmed'. addShield emits 'player:healed' { kind: 'shield' }."
+  },
+  {
+   "severity": "minor",
+   "area": "player - aim point for enemies",
+   "problem": "Enemies have only player.eye (top of the body) or position (feet) to aim at; the body centre lives on the HitTarget (combat.getTarget(player.targetId).center). Kinds will pick different points, and shots aimed at the eye fly over a sliding player.",
+   "proposedChange": "PlayerSystem adds `readonly center: THREE.Vector3` (position + height * 0.55, the same vector as its HitTarget.center). Doc: enemy projectiles and beams aim at player.center (+ velocity lead); LOS checks go aimPoint -> player.center."
+  },
+  {
+   "severity": "minor",
+   "area": "weapons - accuracy and edge rules",
+   "problem": "shotsHit = 'pulls that damaged at least one enemy' cannot be known for hornet rockets (hit resolves later in combat). Unspecified: do grenades/melee count as shots; are grenades free during Overclock (doc mentions only infiniteAmmo); how often chain lightning procs on a 9-pellet blast; and whether a pickup-denied ammo call should be attempted.",
+   "proposedChange": "Doc: shotsFired/shotsHit count the four guns only. Hitscan: counted at fire time. Projectile weapons: weapons subscribes to 'hit:confirmed' and credits one pending pull per weapon id (`pending[weapon]--; shotsHit++`). Grenades are consumed during Overclock, free only with debug.infiniteAmmo. Chain lightning: at most one proc per trigger pull per primary target, never from weapon 'chainLightning'|'explosiveCrit'|'grenade'|'melee'. Add `ProjectileOptions.shotId?: number` echoed as `'hit:confirmed'.shotId` if exact attribution is wanted."
+  },
+  {
+   "severity": "minor",
+   "area": "combat - projectile API details",
+   "problem": "ProjectileOptions does not say opts/vectors are copied (ExplosionOptions does), so callers cannot safely reuse one scratch object; 'default by kind' has no table (radius, damage type, trail, loop, explosion visual, gravity) for callers to rely on; there is no way to remove one projectile; mortar ground telegraphs are created by the kind but only combat knows when/where the shell really lands.",
+   "proposedChange": "Doc: 'opts and its vectors are copied; reuse a module-level object'. Publish `PROJECTILES: Readonly<Record<ProjectileKind, { radius: number; type: DamageType; trail: TrailKind | null; loop: LoopId | null; visual: ExplosionVisual; shootable: boolean }>>` in src/data/projectiles.ts. CombatSystem adds `removeProjectile(id: number, detonate?: boolean): boolean`. ProjectileOptions adds `landingTelegraph?: number` (radius; combat predicts the ballistic impact point, shows a 'mortar' telegraph for the flight time and cancels it on detonation)."
+  },
+  {
+   "severity": "minor",
+   "area": "enemies - arrival sequence details",
+   "problem": "During the arrival behaviour.update is not called, yet the HitTarget is registered right after with aimPoint/sphere centres that only the kind can compute; root visibility during the telegraph and the boss's own intro ('bossSpawn', 'conductorSpawn') vs the generic lightning arrival are unspecified; 16 skitters arriving 0.35 s apart each fire render.lightningFlash and steal a pooled light; spawn() returning null at the 64 cap has no stated consequence for the director's quota.",
+   "proposedChange": "Doc: onSpawn must pose root, aimPoint and all sphere centres from actor.position/yaw. Manager hides root until the bolt lands, then shows it and registers the target. `EnemySpawnOptions.instant` is forced true for 'conductor'; the boss kind runs its own intro in update with actor.invulnerable = true. Arrival flash: render.lightningFlash(<= 0.15) at most once per 0.5 s, fx.lightningBolt(..., { light: false }) for non-heavy spawns. Director: a null spawn keeps the entry pending and retries next frame; boss summons just skip."
+  },
+  {
+   "severity": "minor",
+   "area": "enemies - attack tokens and stun",
+   "problem": "tryAcquireAttackToken(enemyId, weight?) has no stated default weight (stub: 1; EnemyDef.tokenCost exists). Release on death is assigned to the kind's onDespawn, so one forgetful kind leaks the global budget for the rest of the run. EnemyActor.stun is counted down by the manager but nobody is assigned to set it.",
+   "proposedChange": "Doc: default weight = ENEMIES[type].tokenCost; cost 0 always succeeds; re-acquiring while holding returns true. Manager releases the token automatically on death, despawn, stun and when canAttack turns false; a token held longer than 8 s is force-released. Manager sets `stun = max(stun, 0.35)` on info.type 'melee' and `0.2` on 'rail' for mass <= 3; nothing else stuns. Add `readonly tokensInUse: number` for tests."
+  },
+  {
+   "severity": "minor",
+   "area": "director - small API holes",
+   "problem": "spawnPickup(type, position, amount?) cannot say which weapon a 'weapon' crate holds; world.spawnPoints(zone, kind) may be empty (stub does rng.pick on it -> throws); the moment of the zone unlock relative to supply/perk is unstated; perks cannot be granted deterministically for tests; which drop pad is used is unstated.",
+   "proposedChange": "`spawnPickup(type: PickupType, position: Vec3Like, amount?: number, weapon?: WeaponId): void`; `grantPerk(id: PerkId): boolean` (applies one stack + side effects without an offer; false at maxStacks). Doc: order after a clear is cleared (1.6 s) -> zone unlock + announce -> supplyDrop (pad in WaveDef.zone nearest the player) -> perkSelect -> intermission. Fallback when a spawn list is empty: same zone other kind, then any unlocked zone, then nav.randomPointInAnnulus(player, 12, 30). World contract: every zone provides >= 6 ground, >= 3 air, >= 2 heavy points."
+  },
+  {
+   "severity": "minor",
+   "area": "debug / test API",
+   "problem": "Automated checks cannot exercise several systems: tests run in the page and cannot build a DamageInfo (THREE vectors) to damage an enemy part or drive a boss phase; no perk grant; DebugState misses dash, overclock.ready, crouch/slide, velocity, weapon charge/spread/ads, attack tokens, boss invulnerable/dying, spawning counts, particle/voice counts, perk stacks.",
+   "proposedChange": "DebugApi adds `damageEnemy(id: number, amount: number, part?: HitPart): { dealt: number; killed: boolean }` (player faction, through combat.applyDamage), `givePerk(id: PerkId): boolean`, `overclock(): boolean` (fill + activate), `spawnArriving(type: EnemyType, x: number, y: number, z: number): number`. DebugState adds `player.{vx,vy,vz,crouching,sliding,sprinting,dashCharges,overclockReady,invulnerable,lastStand}`, `weapon.{charge,spread,ads,switching}`, `enemiesSpawning`, `enemiesDying`, `tokensInUse`, `boss.{invulnerable,dying}`, `perks: Partial<Record<PerkId, number>>`, `particles`, `voices`, `objective: string`."
+  },
+  {
+   "severity": "minor",
+   "area": "update order - camera vs recoil and shake",
+   "problem": "The player writes ctx.camera inside update (first in the pipeline). Recoil added by weapons.update, shake added by combat.explode and knockback applied by enemy hits in the same substep reach the rendered camera one substep later; the shot's own kick is always a frame late.",
+   "proposedChange": "PlayerSystem doc: 'update() writes the camera after look + movement (so weapons/enemies can project and trace); lateUpdate() rewrites position/rotation/fov + updateMatrixWorld including recoil, shake and step smoothing added during the substep.' getAimRay stays shake-free and reads the current recoil."
+  },
+  {
+   "severity": "minor",
+   "area": "performance traps",
+   "problem": "CollisionWorld is brute force over every box: per-enemy LOS each substep, flyer altitude via world.groundHeightAt, explosion LOS per target and projectile sweeps multiply to tens of thousands of slab tests per frame at 64 enemies x 3 substeps. enemies.get / combat.getTarget are used per frame by the bot/UI and must not be linear. 20+ positional enemy loops plus pickup hums exceed any voice cap with no priority input.",
+   "proposedChange": "Doc: kinds use ctx.enemies.hasLineOfSight (cached) and ctx.nav.heightAt for floor height; never ctx.world.groundHeightAt per frame. `get(id)` and `getTarget(id)` are O(1) (Map). LoopOptions adds `priority?: number` and the rule 'audio keeps at most 12 positional loops audible, virtualising the farthest; handles stay valid'. Physics team: add a uniform XZ grid behind finalize() (interface unchanged)."
+  },
+  {
+   "severity": "minor",
+   "area": "over-engineering to delete",
+   "problem": "Contract surface nobody in the brief needs, each a place for two teams to disagree: ProjectileKind 'shard' (no user); TimeScaleSource 'cinematic' (no cinematic camera during play); Input.value (no analog consumer); LoopId 'pickupHum' per pickup; SoundId 'lanceCharge' one-shot next to LoopId 'lanceChargeLoop'; 'scoreTick'; EnemySpawnOptions.yaw.",
+   "proposedChange": "Delete 'shard', 'cinematic', 'scoreTick', the 'lanceCharge' SoundId (keep the loop + 'lanceChargeCancel'), 'pickupHum' (one shared hum is fx/director-internal). Keep Input.value but document it as unused by gameplay. Keep EnemyBehavior.animate but make it REQUIRED (`animate(dt: number): void`) since the manager now calls it in freezeAi, gameover, victory and !canAttack states."
+  },
+  {
+   "severity": "minor",
+   "area": "core/input.ts",
+   "problem": "(1) A rejected lock is counted twice: the requestPointerLock promise catch and the 'pointerlockerror' event both call onLockFailed, so lock is disabled after 2 real failures instead of 3. (2) Free-look edge-turn resumes the instant capture returns: after clicking a perk card near the left/right 14 % of the canvas the view spins until the mouse moves. (3) D-pad left/up/right are both ui navigation and perk1/2/3, so navigating perk cards on a pad picks instead.",
+   "proposedChange": "(1) In tryLock set `let settled = false` per attempt and count in whichever of promise-catch / pointerlockerror fires first. (2) In requestCapture() set `pointerSeen = false` so edge-turn re-arms only after the next real mousemove. (3) PAD_BINDINGS: remove 'perk1'/'perk2'/'perk3' from D-pad 14/12/15 (keep X/Y/B); UI moves focus with uiLeft/uiRight and confirms with uiConfirm -> director.choosePerk."
+  },
+  {
+   "severity": "minor",
+   "area": "units and conventions",
+   "problem": "knockback is 'm/s along dir, victims scale by mass' but per-ray values stack (breaker 9 x 4.5) and the player's mass is undefined; 'player:damaged'.angle has prose only; world.bossArena.hoverHeight (stub 10) and EnemyDef conductor hoverMin/Max (9-13) are two sources for the boss altitude; killAll(false) kills carry def.score with byPlayer false and it is unstated whether they drop pickups.",
+   "proposedChange": "Doc: victim velocity change = knockback / mass, summed per substep then clamped to 12 m/s; player mass = 2. angle = wrapAngle(dirToYaw(dirX, dirZ) - player.yaw), with dirX/dirZ = -info.dir (0,0 -> angle 0 and UI shows a full ring). Boss anchor = bossArena.center + (0, hoverHeight, 0); def.hoverMin/Max are only the bob range around it; a boss spawned elsewhere (debug) anchors to its spawn point. World-credited kills (killAll, bounds cull) never score and never drop."
+  }
+ ],
+ "overallAssessment": "The contract is unusually thorough (frame pipeline, clocks, feedback ownership, exhaustive Fx/Sound enums all cover the brief) and the gameplay systems are buildable against it, with two exceptions that block the boss: there is no dying/staged-death state in the enemy plug-in life cycle, and a kind cannot set BossHandle phase/invulnerable or emit 'boss:phase'. The enum sets themselves are complete for player, weapons, combat, enemies, boss and director; the problems are OWNERSHIP collisions (launch sounds, grenade bounce, hitPlayer fx, lifeSteal/chainZap, countdown and perk sounds, end-of-run stingers) that will double-fire or stay silent. The biggest integration risks are in the seams: enemy movement (separation, knockback and enemySpeedMul are each owned twice), shield/weak-point reporting through filterDamage, kill credit for tick chain reactions, per-pellet hit feedback, immediate-vs-queued explosions, Overclock semantics for the player's own projectiles and sounds, level-type post/audio parameters that outlive their writer in gameover/pause, and what enemies/projectiles do after the run ends. Flow hazards that can stall or soft-lock a run: perk offer to a dead player, accidental perk picks through shared bindings (with no usable clock in the hard freeze), ammo starvation against the flying boss, and unreachable stragglers. Core code is solid; real defects are small: time.scale reads 0 while paused, director.update(0) runs once per substep in the freeze, 3-consecutive-throw fatal escalation is too coarse for per-entity faults, pointer-lock failures are double counted, and the bot mishandles charge/semi triggers and uncollectable pickups. Nothing was edited. Files reviewed: /home/user/Testing-2/src/core/types.ts, game.ts, time.ts, input.ts, bot.ts, debug.ts, loop.ts, context.ts, events.ts, make.ts, math.ts, pool.ts, constants.ts, settings.ts, storage.ts, rng.ts, palette.ts, fatal.ts; /home/user/Testing-2/src/data/*.ts; all stub src/*/index.ts plus src/physics and src/nav; /home/user/Testing-2/tools/*.mjs."
+}

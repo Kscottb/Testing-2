@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"
+    />
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content="#05080c" />
+    <title>Static Horizon</title>
+    <!-- No favicon file: an empty data URL stops the browser from requesting one. -->
+    <link rel="icon" href="data:," />
+    <!-- Optional web fonts; every font token below carries a full system fallback stack. -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;500;600;700&family=Chakra+Petch:wght@500;600;700&family=Share+Tech+Mono&display=swap"
+    />
+    <style>
+      :root {
+        color-scheme: dark;
+
+        /* Colour script (see src/core/palette.ts). Accents carry gameplay meaning. */
+        --sh-bg: #05080c;
+        --sh-bg-raised: #0b1218;
+        --sh-panel: rgba(11, 18, 24, 0.86);
+        --sh-scrim: rgba(3, 6, 9, 0.72);
+        --sh-line: rgba(53, 224, 255, 0.28);
+        --sh-text: #e8f1f5;
+        --sh-text-dim: #8aa0ad;
+        --sh-cyan: #35e0ff;
+        --sh-enemy: #ff4a1c;
+        --sh-elite: #ff2a7a;
+        --sh-hazard: #ffc21a;
+        --sh-lightning: #c9b8ff;
+        --sh-warning: #ffb000;
+        --sh-danger: #ff3b30;
+        --sh-health: #9dff8a;
+        --sh-shield: #35e0ff;
+        --sh-overclock: #fff2b0;
+
+        /* Type: display / condensed UI / mono data, each with a real fallback stack. */
+        --sh-font-display: 'Chakra Petch', 'Eurostile', 'Bank Gothic', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
+        --sh-font-ui: 'Barlow Condensed', 'Roboto Condensed', 'Arial Narrow', 'Segoe UI', 'Helvetica Neue', Arial,
+          sans-serif;
+        --sh-font-mono: 'Share Tech Mono', ui-monospace, 'SF Mono', 'Cascadia Mono', Consolas, 'Liberation Mono', Menlo,
+          monospace;
+
+        /* Safe-area aware gutters: never less than 16px at the sides. */
+        --sh-gutter: 16px;
+        --sh-safe-top: max(var(--sh-gutter), env(safe-area-inset-top, 0px));
+        --sh-safe-right: max(var(--sh-gutter), env(safe-area-inset-right, 0px));
+        --sh-safe-bottom: max(var(--sh-gutter), env(safe-area-inset-bottom, 0px));
+        --sh-safe-left: max(var(--sh-gutter), env(safe-area-inset-left, 0px));
+
+        /* UI motion: fast and purposeful. */
+        --sh-fast: 120ms;
+        --sh-medium: 220ms;
+        --sh-ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+      }
+
+      *,
+      *::before,
+      *::after {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+        padding: 0;
+      }
+
+      body {
+        background: var(--sh-bg);
+        color: var(--sh-text);
+        font-family: var(--sh-font-ui);
+        overflow: hidden;
+        overscroll-behavior: none;
+        touch-action: none;
+        -webkit-user-select: none;
+        user-select: none;
+        -webkit-tap-highlight-color: transparent;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      #app {
+        position: relative;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: var(--sh-bg);
+      }
+
+      #game {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        display: block;
+        outline: none;
+        touch-action: none;
+      }
+
+      /* UI overlay: click-through by default; interactive children opt in with pointer-events:auto. */
+      #ui {
+        position: absolute;
+        inset: 0;
+        overflow: hidden;
+        pointer-events: none;
+      }
+
+      /* ---- Boot screen: visible from first paint until the game reaches the menu. ---- */
+      #boot {
+        position: absolute;
+        inset: 0;
+        z-index: 10;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 18px;
+        padding: var(--sh-safe-top) var(--sh-safe-right) var(--sh-safe-bottom) var(--sh-safe-left);
+        background: radial-gradient(120% 90% at 50% 40%, var(--sh-bg-raised) 0%, var(--sh-bg) 70%);
+        transition: opacity var(--sh-medium) var(--sh-ease);
+      }
+      #boot.is-done {
+        opacity: 0;
+        pointer-events: none;
+      }
+      .boot-title {
+        margin: 0;
+        font-family: var(--sh-font-display);
+        font-weight: 700;
+        font-size: clamp(28px, 7vw, 64px);
+        letter-spacing: 0.22em;
+        text-indent: 0.22em;
+        text-align: center;
+        color: var(--sh-text);
+      }
+      .boot-sub {
+        margin: 0;
+        font-family: var(--sh-font-mono);
+        font-size: 13px;
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
+        color: var(--sh-text-dim);
+        text-align: center;
+      }
+      .boot-track {
+        width: min(320px, 70vw);
+        height: 2px;
+        background: var(--sh-line);
+        overflow: hidden;
+      }
+      #boot-bar {
+        width: 100%;
+        height: 100%;
+        background: var(--sh-cyan);
+        transform: scaleX(0.04);
+        transform-origin: left center;
+        transition: transform var(--sh-medium) var(--sh-ease);
+      }
+
+      /* ---- Fatal error panel: plain language, always above everything. ---- */
+      #fatal {
+        position: absolute;
+        inset: 0;
+        z-index: 20;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: var(--sh-safe-top) var(--sh-safe-right) var(--sh-safe-bottom) var(--sh-safe-left);
+        background: var(--sh-scrim);
+        -webkit-user-select: text;
+        user-select: text;
+      }
+      #fatal[hidden] {
+        display: none;
+      }
+      .fatal-card {
+        width: min(560px, 100%);
+        max-height: 100%;
+        overflow: auto;
+        padding: 28px;
+        background: var(--sh-panel);
+        border: 1px solid var(--sh-danger);
+        border-left-width: 4px;
+      }
+      #fatal-title {
+        margin: 0 0 10px;
+        font-family: var(--sh-font-display);
+        font-size: 24px;
+        font-weight: 600;
+        letter-spacing: 0.08em;
+        color: var(--sh-text);
+      }
+      #fatal-message {
+        margin: 0 0 16px;
+        font-size: 18px;
+        line-height: 1.4;
+        color: var(--sh-text);
+      }
+      #fatal-detail {
+        margin: 0 0 18px;
+        padding: 12px;
+        max-height: 180px;
+        overflow: auto;
+        font-family: var(--sh-font-mono);
+        font-size: 12px;
+        line-height: 1.5;
+        white-space: pre-wrap;
+        word-break: break-word;
+        color: var(--sh-text-dim);
+        background: var(--sh-bg);
+      }
+      #fatal-detail[hidden] {
+        display: none;
+      }
+      #fatal-reload {
+        font-family: var(--sh-font-ui);
+        font-size: 16px;
+        font-weight: 600;
+        letter-spacing: 0.16em;
+        text-transform: uppercase;
+        color: var(--sh-bg);
+        background: var(--sh-cyan);
+        border: 0;
+        padding: 12px 22px;
+        cursor: pointer;
+      }
+      #fatal-reload:focus-visible {
+        outline: 2px solid var(--sh-text);
+        outline-offset: 3px;
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        #boot,
+        #boot-bar {
+          transition: none;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <canvas id="game" tabindex="0" aria-label="Static Horizon game view"></canvas>
+      <div id="ui"></div>
+
+      <div id="boot" role="status" aria-live="polite">
+        <h1 class="boot-title">STATIC HORIZON</h1>
+        <div class="boot-track"><div id="boot-bar"></div></div>
+        <p class="boot-sub" id="boot-label">Powering up suit systems</p>
+      </div>
+
+      <div id="fatal" role="alert" hidden>
+        <div class="fatal-card">
+          <h2 id="fatal-title">Static Horizon hit a problem</h2>
+          <p id="fatal-message">The game could not start. Reloading the page usually fixes this.</p>
+          <pre id="fatal-detail" hidden></pre>
+          <button id="fatal-reload" type="button">Reload</button>
+        </div>
+      </div>
+    </div>
+
+    <noscript>Static Horizon needs JavaScript to run.</noscript>
+
+    <!-- Tiny inline safety net: works even if the game bundle fails to load or parse. -->
+    <script>
+      (function () {
+        function fail(detail) {
+          var panel = document.getElementById('fatal');
+          var boot = document.getElementById('boot');
+          var pre = document.getElementById('fatal-detail');
+          if (boot) boot.style.display = 'none';
+          if (pre && detail) {
+            pre.textContent = String(detail);
+            pre.hidden = false;
+          }
+          if (panel) panel.hidden = false;
+        }
+        window.addEventListener('error', function (e) {
+          var target = e.target;
+          // A failed <script> load never reaches the game's own error handling.
+          if (target && target.tagName === 'SCRIPT') fail('The game files could not be loaded.');
+        }, true);
+        var reload = document.getElementById('fatal-reload');
+        if (reload) {
+          reload.addEventListener('click', function () {
+            window.location.reload();
+          });
+        }
+      })();
+    </script>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

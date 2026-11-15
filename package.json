@@ -1,0 +1,23 @@
+{
+  "name": "static-horizon",
+  "version": "1.0.0",
+  "private": true,
+  "description": "STATIC HORIZON — an original browser-based first-person wave shooter built from scratch with Three.js and fully procedural art and audio.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "three": "0.187.0"
+  },
+  "devDependencies": {
+    "@types/three": "0.187.0",
+    "typescript": "5.9.3",
+    "vite": "7.3.1",
+    "vitest": "3.2.4"
+  }
+}

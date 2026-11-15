@@ -11,12 +11,19 @@
     <title>Static Horizon</title>
     <!-- No favicon file: an empty data URL stops the browser from requesting one. -->
     <link rel="icon" href="data:," />
-    <!-- Optional web fonts; every font token below carries a full system fallback stack. -->
+    <!--
+      Optional web fonts; every font token below carries a full system fallback stack. Loaded as a
+      non-blocking preload that swaps itself in: a plain stylesheet link would hold back the first paint
+      and the game script until the font host answers (or times out).
+    -->
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
-      rel="stylesheet"
+      rel="preload"
+      as="style"
       href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;500;600;700&family=Chakra+Petch:wght@500;600;700&family=Share+Tech+Mono&display=swap"
+      onload="this.onload=null;this.rel='stylesheet'"
+      onerror="this.remove()"
     />
     <style>
       :root {
@@ -83,6 +90,7 @@
         touch-action: none;
         -webkit-user-select: none;
         user-select: none;
+        -webkit-touch-callout: none;
         -webkit-tap-highlight-color: transparent;
         -webkit-font-smoothing: antialiased;
       }

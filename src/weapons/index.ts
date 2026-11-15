@@ -1,11 +1,11 @@
 // STUB: replaced by the weapons team
 import * as THREE from 'three';
 import { WEAPON_IDS } from '../core/constants';
-import { makeDamageInfo, makeShotHit } from '../core/make';
+import { clearDamageInfo, makeDamageInfo, makeShotHit } from '../core/make';
 import { clamp, falloff } from '../core/math';
 import { PALETTE } from '../core/palette';
 import { GRENADE, MELEE, WEAPONS } from '../data/weapons';
-import type { GameContext, InputAction, WeaponDef, WeaponId, WeaponState, WeaponSystem } from '../core/types';
+import type { GameContext, GameMode, InputAction, WeaponDef, WeaponId, WeaponState, WeaponSystem } from '../core/types';
 
 type Slot = { -readonly [K in keyof WeaponState]: WeaponState[K] } & { reloadLeft: number };
 const SLOT_ACTIONS: readonly InputAction[] = ['weapon1', 'weapon2', 'weapon3', 'weapon4'];
@@ -22,7 +22,14 @@ export function createWeaponSystem(ctx: GameContext): WeaponSystem {
   const shot = new THREE.Vector3();
   const hit = makeShotHit();
   const info = makeDamageInfo();
+  const muzzle = new THREE.Vector3();
+  const root = new THREE.Group();
+  root.name = 'weapons';
   const model = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.1, 0.5), new THREE.MeshStandardMaterial({ color: PALETTE.weaponGraphite, emissive: PALETTE.player, emissiveIntensity: 0.15 }));
+  /** Muzzle of the gray-box gun in view space (tracers start at its world-space twin, see render.viewToWorld). */
+  const MUZZLE_VIEW = { x: 0.22, y: -0.2, z: -0.8 };
+  /** Projectile pulls whose hit is still open, per weapon (settled through 'hit:confirmed'). */
+  const pendingPulls: Record<WeaponId, number> = { vector: 0, breaker: 0, lance: 0, hornet: 0 };
   let current: Slot = slots.vector;
   let cooldown = 0, grenades = 0, grenadeCooldown = 0, meleeCooldown = 0, shotsFired = 0, shotsHit = 0, ads = 0;
 
@@ -38,13 +45,16 @@ export function createWeaponSystem(ctx: GameContext): WeaponSystem {
     shot.x += (ctx.rng.next() - 0.5) * 2 * spread; shot.y += (ctx.rng.next() - 0.5) * 2 * spread; shot.z += (ctx.rng.next() - 0.5) * 2 * spread;
     shot.normalize();
     ctx.combat.traceShot(origin, shot, range, { faction: 'player', ignoreId: ctx.player.targetId, radius }, hit);
-    if (weapon !== 'melee') ctx.fx.tracer(origin, hit.point);
+    // The trace starts at the eye; what the player SEES starts at the muzzle, on the player's clock.
+    if (weapon !== 'melee') ctx.fx.tracer(ctx.render.viewToWorld(MUZZLE_VIEW, muzzle), hit.point, { clock: 'player' });
     if (hit.kind !== 'target' || !hit.target) return false;
+    clearDamageInfo(info);
     info.amount = damage * ctx.mods.damageMul * falloff(hit.distance, def.falloffStart, def.falloffEnd, def.falloffMin);
     info.type = weapon === 'melee' ? 'melee' : 'bullet'; info.faction = 'player'; info.sourceId = ctx.player.targetId; info.weapon = weapon;
-    info.part = hit.part; info.critScale = def.critScale * ctx.mods.critDamageMul; info.knockback = def.knockback; info.splash = false; info.silent = false;
+    info.part = hit.part; info.sphereIndex = hit.sphereIndex; info.critScale = def.critScale * ctx.mods.critDamageMul; info.knockback = def.knockback;
     info.point.copy(hit.point); info.dir.copy(shot);
-    return ctx.combat.applyDamage(hit.target, info).dealt > 0;
+    const result = ctx.combat.applyDamage(hit.target, info);
+    return result.dealt > 0 || result.absorbed;
   };
 
   const system: WeaponSystem = {
@@ -96,10 +106,24 @@ export function createWeaponSystem(ctx: GameContext): WeaponSystem {
     },
     init(): void {
       model.position.set(0.22, -0.2, -0.55);
-      ctx.viewScene.add(model);
+      root.add(model);
+      ctx.viewScene.add(root);
+      ctx.render.warm(root, 'view');
+      // Projectile pulls are settled when their hit is confirmed (one event credits one open pull).
+      ctx.events.on('hit:confirmed', (e) => {
+        const id = e.weapon as WeaponId;
+        if (pendingPulls[id] > 0) { pendingPulls[id]--; shotsHit++; }
+      });
+    },
+    // Our update stops outside 'playing': hand the ADS coupling and our post level back.
+    onModeChange(mode: GameMode): void {
+      if (mode === 'playing' || mode === 'paused') return;
+      ads = 0;
+      ctx.player.setAds(0, 1, 1);
+      ctx.render.post.adsVignette = 0;
     },
     reset(): void {
-      for (const id of WEAPON_IDS) { slots[id].unlocked = false; slots[id].reserve = 0; slots[id].mag = 0; slots[id].charge = 0; }
+      for (const id of WEAPON_IDS) { slots[id].unlocked = false; slots[id].reserve = 0; slots[id].mag = 0; slots[id].charge = 0; pendingPulls[id] = 0; }
       current = slots.vector; cooldown = 0; grenadeCooldown = 0; meleeCooldown = 0; shotsFired = 0; shotsHit = 0; ads = 0;
       system.unlock('vector');
       grenades = GRENADE.startCount;
@@ -144,7 +168,9 @@ export function createWeaponSystem(ctx: GameContext): WeaponSystem {
           let any = false;
           if (def.delivery === 'projectile') {
             shot.copy(dir).multiplyScalar(def.projectileSpeed);
-            ctx.combat.spawnProjectile({ kind: 'rocket', position: origin, velocity: shot, faction: 'player', ownerId: player.targetId, damage: def.damage * ctx.mods.damageMul, splashRadius: def.splashRadius, splashDamage: def.splashDamage * ctx.mods.damageMul, selfDamageMul: def.selfDamageMul, weapon: current.id });
+            origin.addScaledVector(dir, 0.6);
+            ctx.combat.spawnProjectile({ kind: 'rocket', position: origin, velocity: shot, faction: 'player', ownerId: player.targetId, damage: def.damage * ctx.mods.damageMul, splashRadius: def.splashRadius, splashDamage: def.splashDamage * ctx.mods.damageMul, selfDamageMul: def.selfDamageMul, weapon: current.id, visualOrigin: ctx.render.viewToWorld(MUZZLE_VIEW, muzzle) });
+            pendingPulls[current.id]++;
           } else {
             for (let i = 0; i < def.pellets; i++) any = ray(def, def.pelletSpread + system.spread, def.damage, def.range, current.id) || any;
           }
@@ -166,7 +192,7 @@ export function createWeaponSystem(ctx: GameContext): WeaponSystem {
         ctx.events.emit('weapon:melee', { hit: ray(WEAPONS.vector, 0, MELEE.damage, MELEE.range, 'melee', 0.8) });
       }
     },
-    dispose(): void { ctx.viewScene.remove(model); },
+    dispose(): void { ctx.viewScene.remove(root); },
   };
   return system;
 }

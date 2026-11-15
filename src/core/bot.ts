@@ -8,7 +8,7 @@ import { COL, WEAPON_IDS } from './constants';
 import { makeNavPath } from './make';
 import { angleDelta, clamp, dirToPitch, dirToYaw } from './math';
 import { createRng } from './rng';
-import type { BotOptions, Difficulty, EnemyHandle, GameContext, InputAction, WeaponId } from './types';
+import type { BotOptions, Difficulty, EnemyHandle, GameContext, InputAction, PickupState, WeaponId } from './types';
 
 export interface Bot {
   readonly enabled: boolean;
@@ -51,7 +51,7 @@ export function createBot(ctx: GameContext): Bot {
   let strafeDir = 1;
   let strafeTimer = 0;
   let stuckTimer = 0;
-  let fireCycle = 0;
+  let semiTimer = 0;
   let switchTimer = 0;
   let grenadeTimer = 4;
   let dashTimer = 2;
@@ -86,16 +86,42 @@ export function createBot(ctx: GameContext): Bot {
     return bestEnemy;
   };
 
-  /** Next unlocked weapon (after the current one) that still has ammo; null if none. */
-  const nextUsableWeapon = (): WeaponId | null => {
+  /**
+   * Next unlocked weapon (after the current one) that still has ammo and whose blast would not reach us
+   * at `dist` metres; null if none.
+   */
+  const nextUsableWeapon = (dist: number): WeaponId | null => {
     const current = ctx.weapons.current.id;
     const start = WEAPON_IDS.indexOf(current);
     for (let i = 1; i <= WEAPON_IDS.length; i++) {
       const id = WEAPON_IDS[(start + i) % WEAPON_IDS.length] as WeaponId;
       const w = ctx.weapons.weapons[id];
-      if (id !== current && w.unlocked && w.mag + w.reserve > 0) return id;
+      if (id === current || !w.unlocked || w.mag + w.reserve <= 0) continue;
+      if (w.def.splashRadius > 0 && dist < w.def.splashRadius + 2) continue;
+      return id;
     }
     return null;
+  };
+
+  /** Would walking into this pickup do anything? (A full-health player cannot collect a health cell.) */
+  const pickupUseful = (pickup: PickupState): boolean => {
+    const { player, weapons } = ctx;
+    switch (pickup.type) {
+      case 'health':
+        return player.hp < player.maxHp;
+      case 'shield':
+        return player.shield < player.maxShield;
+      case 'grenade':
+        return weapons.grenades < weapons.grenadeCap;
+      case 'ammo':
+        for (const id of WEAPON_IDS) {
+          const w = weapons.weapons[id];
+          if (w.unlocked && w.reserve < w.reserveMax) return true;
+        }
+        return false;
+      default:
+        return true;
+    }
   };
 
   /** Horizontal unit direction to walk toward `to`, following the nav grid when possible. */
@@ -206,26 +232,49 @@ export function createBot(ctx: GameContext): Bot {
 
     // --- weapons ------------------------------------------------------------------------------
     const weapon = weapons.current;
-    const range = weapon.def.range;
-    // Hold fire in ~1 s cycles with a short release: covers auto, semi and charge triggers.
-    fireCycle = (fireCycle + realDt) % 1.15;
-    const wantFire = aimed && dist < range && fireCycle < 0.98 && !weapon.reloading && !weapons.switching;
-    input.setVirtualButton('fire', wantFire);
+    const def = weapon.def;
+    const ready = !weapon.reloading && !weapons.switching;
+    // Never fire a splash weapon into our own face.
+    const tooClose = def.splashRadius > 0 && dist < def.splashRadius + 2;
+    let holdFire = false;
+    let wantFire = false;
+    semiTimer += realDt;
+    if (target && ready && dist < def.range && !tooClose) {
+      if (def.trigger === 'auto') {
+        holdFire = aimed;
+      } else if (def.trigger === 'charge') {
+        // Releasing cancels the charge: once it started, keep holding until the shot goes off, even
+        // when the aim flickers off the target for a frame.
+        holdFire = aimed || weapon.charge > 0;
+      } else if (aimed && semiTimer >= 60 / (def.rpm * Math.max(0.1, ctx.mods.fireRateMul)) + 0.03) {
+        // Semi-automatic: one press per shot at the weapon's own cadence.
+        semiTimer = 0;
+        input.pressVirtual('fire');
+      }
+      wantFire = aimed;
+    }
+    input.setVirtualButton('fire', holdFire);
     input.setVirtualButton('ads', aimed && dist > 22);
 
     switchTimer += realDt;
-    if (!weapon.reloading && !weapons.switching) {
-      if (weapon.mag === 0 && weapon.reserve > 0) {
+    if (ready) {
+      if (tooClose && switchTimer > 0.5) {
+        const next = nextUsableWeapon(dist);
+        if (next) {
+          switchTimer = 0;
+          input.pressVirtual(WEAPON_ACTIONS[next]);
+        }
+      } else if (weapon.mag === 0 && weapon.reserve > 0) {
         input.pressVirtual('reload');
       } else if (weapon.mag === 0 && weapon.reserve === 0) {
-        const next = nextUsableWeapon();
+        const next = nextUsableWeapon(dist);
         if (next && switchTimer > 0.5) {
           switchTimer = 0;
           input.pressVirtual(WEAPON_ACTIONS[next]);
         }
-      } else if (switchTimer > 7) {
+      } else if (switchTimer > 7 && weapon.charge === 0) {
         switchTimer = 0;
-        const next = nextUsableWeapon();
+        const next = nextUsableWeapon(dist);
         if (next) input.pressVirtual(WEAPON_ACTIONS[next]);
       } else if (!target && weapon.mag < weapon.magSize * 0.5 && weapon.reserve > 0) {
         input.pressVirtual('reload');
@@ -244,7 +293,7 @@ export function createBot(ctx: GameContext): Bot {
         meleeTimer = 0;
         input.pressVirtual('melee');
       }
-      if (weapons.grenades > 0 && aimed && dist > 8 && dist < 30 && grenadeTimer > 9) {
+      if (weapons.grenades > 0 && aimed && dist > 9 && dist < 30 && grenadeTimer > 9) {
         grenadeTimer = 0;
         input.pressVirtual('grenade');
       }
@@ -264,6 +313,7 @@ export function createBot(ctx: GameContext): Bot {
     if (!target || dist > 7) {
       let bestD = 35 * 35;
       for (const pickup of director.pickups) {
+        if (!pickupUseful(pickup)) continue;
         const d = pickup.position.distanceToSquared(player.position) * (pickup.type === 'weapon' ? 0.1 : 1);
         if (d < bestD) {
           bestD = d;
@@ -371,6 +421,7 @@ export function createBot(ctx: GameContext): Bot {
       targetId = 0;
       hasPath = false;
       hasWander = false;
+      semiTimer = 0;
     },
     update,
   };

@@ -1,7 +1,8 @@
 /**
  * Bootstrap: build the context, create every system, boot the game, start the loop.
- * Nothing here depends on URL parameters in normal play; `?test=1` only switches the loop to manual
- * stepping for the automated tools.
+ * Nothing here depends on URL parameters, storage, pointer lock or fullscreen in normal play (the game
+ * also ships as one inline page in a sandboxed frame where none of them exist). Test mode is strictly
+ * opt-in — see isTestMode.
  */
 import { createAudioSystem } from './audio';
 import { createCombatSystem } from './combat';
@@ -23,9 +24,18 @@ import { createUiSystem } from './ui';
 import { createWeaponSystem } from './weapons';
 import { createWorldSystem } from './world';
 
+/**
+ * Automation mode (manual stepping for the tools). Opt-in only: `?test=1` in the URL, or — where no
+ * query string is available, i.e. inside the sandboxed frame — a host that names the frame 'sh-test'.
+ */
 function isTestMode(): boolean {
   try {
-    return new URLSearchParams(window.location.search).get('test') === '1';
+    if (new URLSearchParams(window.location.search).get('test') === '1') return true;
+  } catch {
+    // No readable location: fall through to the frame name.
+  }
+  try {
+    return window.name === 'sh-test';
   } catch {
     return false;
   }

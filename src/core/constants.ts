@@ -4,11 +4,15 @@
 import type {
   Difficulty,
   EnemyType,
+  FxId,
   InputAction,
   PerkId,
   PickupType,
+  ProjectileKind,
   QualityPreset,
+  QualitySetting,
   TimeOfDayId,
+  TimeScaleSource,
   WeaponId,
   ZoneId,
 } from './types';
@@ -27,6 +31,25 @@ export const ZONE_IDS: readonly ZoneId[] = ['deck', 'refinery', 'spire'];
 export const DIFFICULTIES: readonly Difficulty[] = ['recruit', 'veteran', 'nightmare'];
 export const PICKUP_TYPES: readonly PickupType[] = ['ammo', 'health', 'shield', 'grenade', 'weapon'];
 export const QUALITY_PRESETS: readonly QualityPreset[] = ['low', 'medium', 'high', 'ultra'];
+/** Values of SettingsData.quality ('auto' is resolved by render). */
+export const QUALITY_SETTINGS: readonly QualitySetting[] = ['auto', 'low', 'medium', 'high', 'ultra'];
+export const PROJECTILE_KINDS: readonly ProjectileKind[] = [
+  'rocket',
+  'grenade',
+  'plasmaBolt',
+  'lightBolt',
+  'mortar',
+  'bossBolt',
+  'bossMissile',
+];
+export const TIME_SCALE_SOURCES: readonly TimeScaleSource[] = [
+  'overclock',
+  'hitstop',
+  'slowmo',
+  'bossStaging',
+  'perkSelect',
+  'debug',
+];
 export const TIME_OF_DAY_IDS: readonly TimeOfDayId[] = ['dusk', 'twilight', 'stormnight', 'eclipse'];
 export const PERK_IDS: readonly PerkId[] = [
   'damage',
@@ -148,7 +171,12 @@ export const PLAYER = {
   OVERCLOCK_SECONDS: 6,
   OVERCLOCK_SCALE: 0.4,
   LOW_HEALTH: 0.3,
+  /** Knockback divisor of the player (DamageInfo.knockback / MASS = velocity change). */
+  MASS: 2,
 } as const;
+
+/** Upper bound of the knockback velocity a victim accumulates (m/s), whatever the number of rays. */
+export const KNOCKBACK_MAX = 12;
 
 /** Score / combo rules (brief section 3). */
 export const SCORING = {
@@ -161,8 +189,72 @@ export const SCORING = {
   MULTIKILL_BONUS: 150,
 } as const;
 
-/** Hard cap of simultaneously live enemies (EnemySystem.spawn returns null beyond it). */
+/** Hard cap of enemy actors in the scene (EnemySystem.spawn returns null beyond it). */
 export const MAX_ENEMIES = 64;
+/** Hard cap of live projectiles (combat removes the oldest to make room). */
+export const MAX_PROJECTILES = 96;
+/** Length of the lightning arrival (ring telegraph before the bolt), seconds of world time. */
+export const ENEMY_ARRIVAL_SECONDS = 0.8;
+/** The perk1..3 actions are ignored for this long (ctx.time.elapsed) after an offer appears. */
+export const PERK_INPUT_GUARD_SECONDS = 0.6;
+
+/**
+ * STREAM effects (see FxSystem.spawn): one spawn() = one short puff; the owner re-spawns every 0.05 s
+ * while the state lasts. Every other FxId is a BURST: one call is the complete effect.
+ */
+export const FX_STREAM_IDS: readonly FxId[] = [
+  'lanceCharge',
+  'riveterCharge',
+  'lancerCharge',
+  'bossCharge',
+  'bossSweepCharge',
+  'bossSweepHit',
+  'tickArm',
+  'enemySmoke',
+  'enemySparks',
+  'slideSparks',
+  'steamVent',
+  'sparkShower',
+  'hazardArc',
+];
+/** Seconds between two spawn() calls of a stream effect. */
+export const FX_STREAM_INTERVAL = 0.05;
+
+/**
+ * Pool capacities FX allocates in init() (the "ultra" caps; quality presets only lower the active
+ * counts). telegraph() and persistent beam() never fail below these numbers.
+ */
+export const FX_CAPS = {
+  particles: 4000,
+  telegraphs: 96,
+  beams: 32,
+  trails: 96,
+  bolts: 24,
+  damageNumbers: 64,
+  tracers: 128,
+  lights: 6,
+  /** Pooled lights that may be held by keyed (moving / pulsing) lightFlash calls. */
+  keyedLights: 2,
+} as const;
+
+/**
+ * mesh.renderOrder for every transparent or additive object (see RENDERING CONVENTIONS in core/types.ts),
+ * so effects of different systems sort the same way from every camera position.
+ */
+export const RENDER_ORDER = {
+  SKY: -100,
+  OPAQUE: 0,
+  DECAL: 10,
+  TELEGRAPH: 12,
+  WORLD_TRANSPARENT: 20,
+  PICKUP: 25,
+  ENEMY_SHIELD: 30,
+  FX_ALPHA: 40,
+  BEAM: 50,
+  FX_ADDITIVE: 60,
+  WEATHER: 70,
+  DAMAGE_NUMBER: 80,
+} as const;
 
 /** Storage keys (all prefixed by the storage wrapper). */
 export const STORAGE_KEYS = {

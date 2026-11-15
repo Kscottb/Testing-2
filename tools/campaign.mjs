@@ -100,7 +100,7 @@ try {
       assisted = false;
     } else if (sim - lastProgress >= STALL_SECONDS) {
       if (god && !assisted) {
-        // One helping hand per stall: top up ammo in case the bot ran dry against something it cannot melee.
+        // One helping hand per stall (should never be needed: the director's mercy drop keeps ammo coming).
         assisted = true;
         report.assists++;
         lastProgress = sim;

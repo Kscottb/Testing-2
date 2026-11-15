@@ -6,7 +6,12 @@
 //   await game.shot('/tmp/x.png');
 //   await game.close();
 //
-// The page is always opened with ?test=1 (manual stepping, fixed seed, no pointer lock).
+// By default the page is opened with ?test=1 (manual stepping, fixed seed, no pointer lock).
+//   test: false          no test mode: the real requestAnimationFrame loop runs and step() just waits
+//   embed: 'sandbox'     (dist only) the game runs inside <iframe sandbox="allow-scripts"> of a host page,
+//                        the way it ships: no query string, no storage, no pointer lock, no fullscreen.
+//                        With test: true the frame is named 'sh-test', which is the opt-in for test mode
+//                        where no query string exists.
 import fs from 'node:fs';
 import http from 'node:http';
 import { createRequire } from 'node:module';
@@ -62,8 +67,26 @@ async function startDevServer(port) {
   return { url: `http://127.0.0.1:${port}`, close: () => server.close() };
 }
 
-/** Minimal static file server for ./dist. */
-function startDistServer(port) {
+/** Host page that embeds the game the way it ships: one sandboxed frame without a query string. */
+function hostPage(test) {
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Static Horizon host</title>
+    <style>
+      html, body { height: 100%; margin: 0; background: #000; overflow: hidden; }
+      iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }
+    </style>
+  </head>
+  <body>
+    <iframe id="game-frame" sandbox="allow-scripts"${test ? ' name="sh-test"' : ''} src="/index.html"></iframe>
+  </body>
+</html>`;
+}
+
+/** Minimal static file server for ./dist (plus the sandbox host page at /__host.html). */
+function startDistServer(port, test) {
   const dist = path.join(ROOT, 'dist');
   if (!fs.existsSync(path.join(dist, 'index.html'))) {
     throw new Error('dist/index.html not found — run "npm run build" first');
@@ -72,6 +95,11 @@ function startDistServer(port) {
     try {
       const url = new URL(req.url ?? '/', 'http://localhost');
       let rel = decodeURIComponent(url.pathname);
+      if (rel === '/__host.html') {
+        res.writeHead(200, { 'content-type': MIME['.html'], 'cache-control': 'no-store' });
+        res.end(hostPage(test));
+        return;
+      }
       if (rel.endsWith('/')) rel += 'index.html';
       const file = path.normalize(path.join(dist, rel));
       if (!file.startsWith(dist) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) {
@@ -82,6 +110,8 @@ function startDistServer(port) {
       res.writeHead(200, {
         'content-type': MIME[path.extname(file).toLowerCase()] ?? 'application/octet-stream',
         'cache-control': 'no-store',
+        // A sandboxed frame has an opaque origin: its module script is a cross-origin request.
+        'access-control-allow-origin': '*',
       });
       fs.createReadStream(file).pipe(res);
     } catch (error) {
@@ -100,26 +130,49 @@ function startDistServer(port) {
   });
 }
 
+/** Console errors a sandboxed frame produces by design (the game handles both refusals). */
+const SANDBOX_NOISE = [
+  /Blocked pointer lock on an element because the element's frame is sandboxed/i,
+  /Permissions policy violation: fullscreen/i,
+];
+
 /**
  * Launch the game in headless Chromium.
- * @param {{mode?: 'dev'|'dist', port?: number, width?: number, height?: number, touch?: boolean, query?: string}} [options]
- * @returns {Promise<{page: import('playwright').Page, errors: string[], url: string,
+ * @param {{mode?: 'dev'|'dist', port?: number, width?: number, height?: number, touch?: boolean, query?: string,
+ *   test?: boolean, embed?: 'none'|'sandbox', dpr?: number, args?: string[], reducedMotion?: 'reduce'|'no-preference'}} [options]
+ * @returns {Promise<{page: import('playwright').Page, frame: import('playwright').Frame, errors: string[], url: string,
+ *   test: boolean, embed: string, canvasBox: () => Promise<{x: number, y: number, width: number, height: number}>,
  *   sh: (fn: Function, ...args: any[]) => Promise<any>,
  *   step: (seconds: number, opts?: {dt?: number, render?: boolean|number}) => Promise<any>,
  *   shot: (file: string) => Promise<void>, close: () => Promise<void>}>}
  */
 export async function launchGame(options = {}) {
-  const { mode = 'dev', port = 5200, width = 1280, height = 720, touch = false, query = '' } = options;
-  const server = mode === 'dist' ? await startDistServer(port) : await startDevServer(port);
+  const {
+    mode = 'dev',
+    port = 5200,
+    width = 1280,
+    height = 720,
+    touch = false,
+    query = '',
+    test = true,
+    embed = 'none',
+    dpr = 1,
+    args = [],
+    reducedMotion = 'reduce',
+  } = options;
+  if (embed !== 'none' && embed !== 'sandbox') throw new Error(`unknown embed "${embed}"`);
+  if (embed === 'sandbox' && mode !== 'dist') throw new Error('embed "sandbox" needs --mode dist');
+  const server = mode === 'dist' ? await startDistServer(port, test) : await startDevServer(port);
   let browser;
   try {
     const { chromium } = require('playwright');
-    browser = await chromium.launch();
+    browser = await chromium.launch({ args });
     const context = await browser.newContext({
       viewport: { width, height },
-      deviceScaleFactor: 1,
+      deviceScaleFactor: dpr,
       hasTouch: touch,
       isMobile: touch,
+      reducedMotion,
     });
     // The optional web fonts must never hit the network (or fail) during tests.
     await context.route(/fonts\.(googleapis|gstatic)\.com/, (route) =>
@@ -127,18 +180,31 @@ export async function launchGame(options = {}) {
     );
     const page = await context.newPage();
     const errors = [];
+    const noise = embed === 'sandbox' ? SANDBOX_NOISE : [];
+    const record = (text) => {
+      if (!noise.some((pattern) => pattern.test(text))) errors.push(text);
+    };
     page.on('console', (msg) => {
-      if (msg.type() === 'error') errors.push(`console: ${msg.text()}`);
+      if (msg.type() === 'error') record(`console: ${msg.text()}`);
     });
-    page.on('pageerror', (error) => errors.push(`pageerror: ${error.message}`));
+    page.on('pageerror', (error) => record(`pageerror: ${error.message}`));
     page.on('requestfailed', (request) => {
-      errors.push(`requestfailed: ${request.url()} ${request.failure()?.errorText ?? ''}`);
+      record(`requestfailed: ${request.url()} ${request.failure()?.errorText ?? ''}`);
     });
 
-    const url = `${server.url}/?test=1${query ? `&${query.replace(/^[?&]/, '')}` : ''}`;
+    const params = [test ? 'test=1' : '', query.replace(/^[?&]/, '')].filter(Boolean).join('&');
+    // The sandboxed frame never gets a query string: test mode is opted into through its name.
+    const url = embed === 'sandbox' ? `${server.url}/__host.html` : `${server.url}/${params ? `?${params}` : ''}`;
     await page.goto(url, { waitUntil: 'load', timeout: 120000 });
+    /** Where the game lives: the page itself, or the sandboxed frame inside the host page. */
+    let frame = page.mainFrame();
+    if (embed === 'sandbox') {
+      const element = await page.waitForSelector('#game-frame', { timeout: 120000 });
+      frame = await element.contentFrame();
+      if (!frame) throw new Error('the sandboxed game frame did not load');
+    }
     try {
-      await page.waitForFunction(
+      await frame.waitForFunction(
         () => {
           const sh = window.__SH;
           const fatal = document.getElementById('fatal');
@@ -150,9 +216,9 @@ export async function launchGame(options = {}) {
     } catch (error) {
       throw new Error(`game did not become ready: ${error.message}\n${errors.join('\n')}`);
     }
-    const ready = await page.evaluate(() => Boolean(window.__SH && window.__SH.ready && !window.__SH.fatal));
+    const ready = await frame.evaluate(() => Boolean(window.__SH && window.__SH.ready && !window.__SH.fatal));
     if (!ready) {
-      const detail = await page.evaluate(() => {
+      const detail = await frame.evaluate(() => {
         const sh = window.__SH;
         const fromGame = sh ? sh.errors.map((e) => `${e.source}: ${e.message}\n${e.stack}`) : [];
         const panel = document.getElementById('fatal-detail');
@@ -161,16 +227,32 @@ export async function launchGame(options = {}) {
       throw new Error(`game failed to boot:\n${detail}\n${errors.join('\n')}`);
     }
 
-    /** Run `fn(window.__SH, ...args)` in the page. `fn` must be self-contained; args must be JSON-serialisable. */
-    const sh = (fn, ...args) =>
-      page.evaluate(([source, list]) => (0, eval)(`(${source})`)(window.__SH, ...list), [fn.toString(), args]);
+    /** Run `fn(window.__SH, ...args)` in the game's frame. `fn` must be self-contained; args must be JSON-serialisable. */
+    const sh = (fn, ...list) =>
+      frame.evaluate(([source, values]) => (0, eval)(`(${source})`)(window.__SH, ...values), [fn.toString(), list]);
 
     return {
       page,
+      frame,
       errors,
       url,
+      test,
+      embed,
       sh,
-      step: (seconds, opts) => sh((SH, s, o) => SH.step(s, o ?? undefined), seconds, opts ?? null),
+      /** Manual stepping in test mode; with the real loop it simply lets `seconds` of wall time pass. */
+      step: test
+        ? (seconds, opts) => sh((SH, s, o) => SH.step(s, o ?? undefined), seconds, opts ?? null)
+        : async (seconds) => {
+            await page.waitForTimeout(seconds * 1000);
+            return sh((SH) => SH.state());
+          },
+      /** Bounding box of the game canvas in page coordinates (for real mouse / touch input). */
+      async canvasBox() {
+        const canvas = await frame.waitForSelector('#game');
+        const box = await canvas.boundingBox();
+        if (!box) throw new Error('the game canvas has no box');
+        return box;
+      },
       async shot(file) {
         fs.mkdirSync(path.dirname(path.resolve(file)), { recursive: true });
         await sh((SH) => SH.renderFrame());

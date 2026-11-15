@@ -39,12 +39,30 @@ export interface GameCore extends Game {
   dispose(): void;
 }
 
-const CONSECUTIVE_FAILURES_FATAL = 3;
-/** A call that keeps failing now and then (never 3 in a row) is still fatal after this many failures. */
+/** A system call that throws this many times in a row is fatal. */
+const CONSECUTIVE_FAILURES_FATAL = 10;
+/** A call (or a reportError source) that keeps failing now and then is still fatal after this many failures. */
 const TOTAL_FAILURES_FATAL = 30;
+/** Calls that can never be fatal (see isSoft) are simply no longer made after this many failures. */
+const SOFT_FAILURES_DISABLE = 3;
 const MAX_RECORDED_ERRORS = 200;
 /** Seconds after an automatic pause during which the pause action cannot resume. */
 const PAUSE_TOGGLE_GUARD = 0.25;
+
+/**
+ * Sound, particles, the bot and a resize may never take the game down: a WebAudio or particle bug costs
+ * sound or sparks, not the run. (Failures during init are a different matter and stay fatal.)
+ */
+function isSoft(key: string): boolean {
+  return (
+    key === 'audio' ||
+    key === 'fx' ||
+    key.endsWith(':audio') ||
+    key.endsWith(':fx') ||
+    key === 'update:bot' ||
+    key === 'resize:render'
+  );
+}
 
 function describe(error: unknown): { message: string; stack: string } {
   if (error instanceof Error) return { message: error.message || error.name, stack: error.stack ?? '' };
@@ -61,6 +79,8 @@ export function createGame(ctx: CoreContext): GameCore {
   const errors: DebugError[] = [];
   const failStreak = new Map<string, number>();
   const failTotal = new Map<string, number>();
+  /** Soft calls that failed too often and are no longer made. */
+  const disabled = new Set<string>();
   const cameraOverride: CameraOverride = {
     active: false,
     position: new THREE.Vector3(),
@@ -76,6 +96,8 @@ export function createGame(ctx: CoreContext): GameCore {
   let booted = false;
   let resizeObserver: ResizeObserver | null = null;
   let autoPausedAt = -Infinity;
+  /** The canvas changed size: applied at the start of the next frame, never between a draw and its paint. */
+  let resizePending = true;
 
   const storedBest = ctx.storage.getJson<Partial<BestRecord>>(STORAGE_KEYS.BEST, {});
   const best: BestRecord = {
@@ -86,7 +108,7 @@ export function createGame(ctx: CoreContext): GameCore {
     victories: Number.isFinite(storedBest.victories) ? Math.max(0, Number(storedBest.victories)) : 0,
   };
 
-  /** Lifecycle order (init, reset, onModeChange, dispose in reverse). */
+  /** Lifecycle order (init, onModeChange, dispose in reverse). */
   const systems = (): [string, System][] => [
     ['world', ctx.world],
     ['render', ctx.render],
@@ -99,6 +121,15 @@ export function createGame(ctx: CoreContext): GameCore {
     ['director', ctx.director],
     ['ui', ctx.ui],
   ];
+
+  /**
+   * Reset order: audio FIRST (its stopAll must not kill what the other systems set up in their own
+   * reset), then the lifecycle order.
+   */
+  const resetOrder = (): [string, System][] => {
+    const list = systems();
+    return [...list.filter(([name]) => name === 'audio'), ...list.filter(([name]) => name !== 'audio')];
+  };
 
   // --- errors ---------------------------------------------------------------------------------
   const recordError = (source: string, error: unknown): DebugError => {
@@ -139,9 +170,14 @@ export function createGame(ctx: CoreContext): GameCore {
     const entry = recordError(source, error);
     if (isFatal) {
       raiseFatal(source, entry.message, entry.stack);
-    } else {
-      events.emit('game:error', { source, message: entry.message, fatal: false });
+      return;
     }
+    // Errors reported by the systems themselves (one broken enemy, one event handler) count per source:
+    // a source that keeps failing is as fatal as a system call that does — unless it is sound or fx.
+    const total = (failTotal.get(source) ?? 0) + 1;
+    failTotal.set(source, total);
+    if (total >= TOTAL_FAILURES_FATAL && !isSoft(source)) raiseFatal(source, entry.message, entry.stack);
+    else events.emit('game:error', { source, message: entry.message, fatal: false });
   };
 
   /** A contained system exception: record it, escalate when the same call keeps failing. */
@@ -151,6 +187,11 @@ export function createGame(ctx: CoreContext): GameCore {
     failStreak.set(key, streak);
     failTotal.set(key, total);
     const entry = recordError(key, error);
+    if (isSoft(key)) {
+      if (total >= SOFT_FAILURES_DISABLE) disabled.add(key);
+      events.emit('game:error', { source: key, message: entry.message, fatal: false });
+      return;
+    }
     if (streak >= CONSECUTIVE_FAILURES_FATAL || total >= TOTAL_FAILURES_FATAL) raiseFatal(key, entry.message, entry.stack);
     else events.emit('game:error', { source: key, message: entry.message, fatal: false });
   };
@@ -159,8 +200,22 @@ export function createGame(ctx: CoreContext): GameCore {
     if (failStreak.size > 0 && failStreak.has(key)) failStreak.delete(key);
   };
 
+  const skip = (key: string): boolean => disabled.size > 0 && disabled.has(key);
+
+  /** Contained call for the rare paths (mode changes, resets, unlock). Hot paths spell the try/catch out. */
+  const guarded = (key: string, fn: () => void): void => {
+    if (skip(key)) return;
+    try {
+      fn();
+      ok(key);
+    } catch (error) {
+      contain(key, error);
+    }
+  };
+
   /** `key` is the full error source, e.g. 'update:player' (literal strings: no per-frame allocation). */
   const update = (key: string, system: System, dt: number): void => {
+    if (skip(key)) return;
     try {
       system.update(dt);
       ok(key);
@@ -170,7 +225,7 @@ export function createGame(ctx: CoreContext): GameCore {
   };
 
   const late = (key: string, system: System, dt: number): void => {
-    if (!system.lateUpdate) return;
+    if (!system.lateUpdate || skip(key)) return;
     try {
       system.lateUpdate(dt);
       ok(key);
@@ -182,7 +237,9 @@ export function createGame(ctx: CoreContext): GameCore {
   // --- mode -----------------------------------------------------------------------------------
   const wantsPointer = (): boolean => {
     try {
-      return ctx.ui.wantsPointer();
+      const wants = ctx.ui.wantsPointer();
+      ok('wantsPointer:ui');
+      return wants;
     } catch (error) {
       contain('wantsPointer:ui', error);
       return true;
@@ -191,7 +248,9 @@ export function createGame(ctx: CoreContext): GameCore {
 
   const uiConsumesPause = (): boolean => {
     try {
-      return ctx.ui.consumesPauseAction();
+      const consumes = ctx.ui.consumesPauseAction();
+      ok('consumesPauseAction:ui');
+      return consumes;
     } catch (error) {
       contain('consumesPauseAction:ui', error);
       return false;
@@ -212,11 +271,7 @@ export function createGame(ctx: CoreContext): GameCore {
     mode = next;
     for (const [name, system] of systems()) {
       if (!system.onModeChange) continue;
-      try {
-        system.onModeChange(next, prev);
-      } catch (error) {
-        contain(`onModeChange:${name}`, error);
-      }
+      guarded(`onModeChange:${name}`, () => system.onModeChange?.(next, prev));
     }
     events.emit('game:mode', { mode: next, prev });
     applyPointerPolicy();
@@ -226,21 +281,13 @@ export function createGame(ctx: CoreContext): GameCore {
     time.reset();
     resetModifiers(ctx.mods);
     input.clearVirtual();
-    for (const [name, system] of systems()) {
-      try {
-        system.reset();
-      } catch (error) {
-        contain(`reset:${name}`, error);
-      }
+    for (const [name, system] of resetOrder()) {
+      guarded(`reset:${name}`, () => system.reset());
     }
   };
 
   const unlockAudio = (): void => {
-    try {
-      ctx.audio.unlock();
-    } catch (error) {
-      contain('unlock:audio', error);
-    }
+    guarded('unlock:audio', () => ctx.audio.unlock());
   };
 
   // --- facade ---------------------------------------------------------------------------------
@@ -252,11 +299,7 @@ export function createGame(ctx: CoreContext): GameCore {
     ctx.rng.seed(ctx.testMode ? 0x51a71c + runIndex : (Date.now() ^ (Math.random() * 0x7fffffff)) >>> 0);
     unlockAudio();
     resetAll();
-    try {
-      ctx.director.startRun(next);
-    } catch (error) {
-      contain('startRun:director', error);
-    }
+    guarded('startRun:director', () => ctx.director.startRun(next));
     // Forced: a restart from 'playing' still notifies everyone (onModeChange('playing', 'playing')).
     setMode('playing', true);
     events.emit('run:start', { difficulty: next, runIndex });
@@ -310,7 +353,7 @@ export function createGame(ctx: CoreContext): GameCore {
   };
 
   // --- pipeline -------------------------------------------------------------------------------
-  const simulate = (): void => {
+  const simulate = (firstSubstep: boolean): void => {
     const dt = time.dt;
     if (mode === 'playing') {
       if (time.scale > 0) {
@@ -329,7 +372,9 @@ export function createGame(ctx: CoreContext): GameCore {
         late('lateUpdate:world', ctx.world, dt);
         late('lateUpdate:director', ctx.director, dt);
         late('lateUpdate:fx', ctx.fx, dt);
-      } else {
+      } else if (firstSubstep) {
+        // Hard freeze (perk select): only the director runs, once per FRAME — it polls input edges,
+        // which exist in the first substep only, and must not see one frame as several.
         update('update:director', ctx.director, 0);
       }
     } else if (mode === 'gameover' || mode === 'victory') {
@@ -361,14 +406,37 @@ export function createGame(ctx: CoreContext): GameCore {
     }
   };
 
+  const requestResize = (): void => {
+    resizePending = true;
+  };
+
+  /**
+   * Resizing reallocates the drawing buffer, which clears it: doing that inside the ResizeObserver
+   * callback (after the frame was drawn, before it is painted) would present a blank frame.
+   */
+  const applyResize = (): void => {
+    resizePending = false;
+    if (fatal || skip('resize:render')) return;
+    try {
+      ctx.render.resize();
+      ok('resize:render');
+    } catch (error) {
+      contain('resize:render', error);
+      return;
+    }
+    events.emit('view:resize', { width: ctx.render.width, height: ctx.render.height });
+  };
+
   const frame = (realDtIn: number, render = true): void => {
     if (fatal || mode === 'boot') return;
     const realDt = clamp(Number.isFinite(realDtIn) ? realDtIn : 0, 0, MAX_FRAME_DT);
     time.beginFrame(realDt);
+    if (resizePending) applyResize();
 
-    if (game.botUpdate) {
+    if (game.botUpdate && !skip('update:bot')) {
       try {
         game.botUpdate(realDt);
+        ok('update:bot');
       } catch (error) {
         contain('update:bot', error);
       }
@@ -388,8 +456,8 @@ export function createGame(ctx: CoreContext): GameCore {
     const stepDt = realDt / steps;
     for (let i = 0; i < steps; i++) {
       input.setEdgesVisible(i === 0);
-      time.advance(stepDt, isSimulating(), mode === 'playing');
-      simulate();
+      time.advance(stepDt, isSimulating(), mode === 'playing', i, steps);
+      simulate(i === 0);
       if (fatal) return;
     }
     input.setEdgesVisible(true);
@@ -407,37 +475,39 @@ export function createGame(ctx: CoreContext): GameCore {
 
   const renderOnly = (): void => {
     if (fatal || mode === 'boot') return;
+    if (resizePending) applyResize();
     draw();
   };
 
   // --- boot -----------------------------------------------------------------------------------
-  const resize = (): void => {
-    if (fatal) return;
-    try {
-      ctx.render.resize();
-      events.emit('view:resize', { width: ctx.render.width, height: ctx.render.height });
-    } catch (error) {
-      contain('resize:render', error);
-    }
-  };
-
   const onInputCapture = (e: { captured: boolean; intentional: boolean }): void => {
     if (e.intentional || mode !== 'playing') return;
     autoPausedAt = time.elapsed;
     pause();
   };
 
-  const onFirstGesture = (): void => {
+  /**
+   * Every user gesture (re)unlocks audio: a context created outside a qualifying gesture stays
+   * suspended, and which event grants activation differs per browser (pointerup / touchend / click on
+   * iOS, pointerdown / keydown elsewhere).
+   */
+  const onGesture = (): void => {
     if (booted && !fatal) unlockAudio();
   };
+  const GESTURE_EVENTS = ['pointerdown', 'pointerup', 'touchend', 'click', 'keydown'] as const;
+
+  /** Let the browser paint. setTimeout rather than rAF so hidden tabs and manual stepping still boot. */
+  const nextTask = (): Promise<void> => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
   const boot = async (): Promise<void> => {
     const list = systems();
-    const total = list.length + 1;
+    const total = list.length + 2;
     let done = 0;
     for (const [name, system] of list) {
       setBootProgress(`Initialising ${name}`, done / total);
-      events.emit('boot:progress', { label: name, fraction: done / total });
+      // Awaiting a synchronous init() only yields a microtask: without a real task boundary the
+      // boot bar would never repaint between systems.
+      await nextTask();
       try {
         await system.init();
       } catch (error) {
@@ -454,18 +524,25 @@ export function createGame(ctx: CoreContext): GameCore {
       }
       done++;
     }
+
+    // Every system has built its meshes by now (also the pooled, hidden ones): compile all shaders
+    // once so nothing compiles in the middle of a fight.
+    setBootProgress('Warming up', done / total);
+    await nextTask();
+    guarded('warm:render', () => {
+      ctx.render.warm(ctx.scene, 'world');
+      ctx.render.warm(ctx.viewScene, 'view');
+    });
     setBootProgress('Ready', 1);
-    events.emit('boot:progress', { label: 'ready', fraction: 1 });
 
     events.on('input:capture', onInputCapture);
-    window.addEventListener('resize', resize);
-    window.addEventListener('pointerdown', onFirstGesture);
-    window.addEventListener('keydown', onFirstGesture);
+    window.addEventListener('resize', requestResize);
+    for (const name of GESTURE_EVENTS) window.addEventListener(name, onGesture);
     if (typeof ResizeObserver !== 'undefined') {
-      resizeObserver = new ResizeObserver(resize);
+      resizeObserver = new ResizeObserver(requestResize);
       resizeObserver.observe(ctx.canvas);
     }
-    resize();
+    applyResize();
 
     resetAll();
     booted = true;
@@ -475,12 +552,12 @@ export function createGame(ctx: CoreContext): GameCore {
   };
 
   const dispose = (): void => {
-    window.removeEventListener('resize', resize);
-    window.removeEventListener('pointerdown', onFirstGesture);
-    window.removeEventListener('keydown', onFirstGesture);
+    window.removeEventListener('resize', requestResize);
+    for (const name of GESTURE_EVENTS) window.removeEventListener(name, onGesture);
     events.off('input:capture', onInputCapture);
     if (resizeObserver) resizeObserver.disconnect();
     resizeObserver = null;
+    ctx.settings.flush();
     for (const [name, system] of systems().reverse()) {
       try {
         system.dispose();

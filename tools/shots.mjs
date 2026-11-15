@@ -1,7 +1,8 @@
 // Screenshot tour for visual review.
 //   node tools/shots.mjs --out <dir> [--mode dev|dist] [--port 5200] [--size 1280x720]
-// Writes: menu, gameplay in each zone / time of day, every enemy type, every weapon viewmodel,
-// perk screen, pause, game over, victory, and a 390x844 touch layout.
+// Writes: menu (+ the difficulty / settings / controls screens when the UI has them), gameplay in each
+// zone / time of day, every enemy type, every weapon viewmodel, perk screen, pause, game over, victory,
+// and a 390x844 touch layout (with real touches on the touch controls when they exist).
 import path from 'node:path';
 import { gameErrors, launchGame, parseArgs } from './harness.mjs';
 
@@ -22,6 +23,8 @@ const WEAPONS = ['vector', 'breaker', 'lance', 'hornet'];
 
 const files = [];
 const notes = [];
+/** Results of the real-touch checks (informational: listed in the report, not part of the exit code). */
+const touchChecks = [];
 let failure = '';
 let errors = [];
 
@@ -46,6 +49,16 @@ async function tour(game) {
   // --- menu ---
   await step(1.5, { render: 30 });
   await shot('menu');
+
+  // --- menu sub-screens, forced through the debug hook (a UI without them simply keeps its screen) ---
+  for (const screen of ['difficulty', 'settings', 'controls']) {
+    await sh((SH, name) => SH.ui(name), screen);
+    await step(0.4, { render: 8 });
+    if ((await sh((SH) => SH.ctx.ui.screen)) === screen) await shot(`ui-${screen}`);
+    else notes.push(`the UI has no "${screen}" screen to show`);
+  }
+  await sh((SH) => SH.ui(null));
+  await step(0.2);
 
   // --- gameplay: each zone at its time of day (plus the remaining times on the last zone) ---
   await sh((SH) => {
@@ -210,7 +223,66 @@ async function touchTour(game) {
   const play = path.join(out, '91-touch-gameplay.png');
   await game.shot(play);
   files.push(play);
+  await realTouches(game);
   errors = errors.concat(await gameErrors(game), game.errors);
+}
+
+/**
+ * Real touch input on the touch controls (found by their `data-touch` attribute, see UiSystem):
+ * hold the fire button, drag the look zone, tap pause. A UI without touch controls is only noted.
+ */
+async function realTouches(game) {
+  const { sh, step, page, frame } = game;
+  const center = async (selector) => {
+    const element = await frame.$(selector);
+    const box = element ? await element.boundingBox() : null;
+    return box ? { x: box.x + box.width / 2, y: box.y + box.height / 2 } : null;
+  };
+  const fire = await center('[data-touch="fire"]');
+  if (!fire) {
+    notes.push('no [data-touch] elements: the UI has no touch controls yet, real touches skipped');
+    return;
+  }
+  const record = (name, ok, detail) => touchChecks.push({ name, ok: Boolean(ok), detail: ok ? '' : String(detail) });
+  try {
+    const cdp = await page.context().newCDPSession(page);
+    const touch = (type, points) => cdp.send('Input.dispatchTouchEvent', { type, touchPoints: points });
+    await sh((SH) => SH.freezeAi(true));
+
+    let s = await sh((SH) => SH.state());
+    const mag0 = s.weapon.mag;
+    await touch('touchStart', [fire]);
+    s = await step(0.5);
+    await touch('touchEnd', []);
+    s = await step(0.1);
+    record('holding the fire button fires', s.weapon.mag < mag0 || s.weapon.reloading, `mag ${mag0} -> ${s.weapon.mag}`);
+
+    const look = await center('[data-touch="look"]');
+    if (look) {
+      const yaw0 = s.player.yaw;
+      await touch('touchStart', [look]);
+      for (let i = 1; i <= 6; i++) {
+        await touch('touchMove', [{ x: look.x - i * 12, y: look.y }]);
+        await step(0.05);
+      }
+      await touch('touchEnd', []);
+      s = await step(0.1);
+      record('dragging the look zone turns the view', Math.abs(s.player.yaw - yaw0) > 0.05, `yaw ${yaw0} -> ${s.player.yaw}`);
+    } else {
+      notes.push('no [data-touch="look"] zone found');
+    }
+
+    const pause = await center('[data-touch="pause"]');
+    if (pause) {
+      await page.touchscreen.tap(pause.x, pause.y);
+      s = await step(0.2);
+      record('tapping pause pauses', s.mode === 'paused', `mode=${s.mode}`);
+    } else {
+      notes.push('no [data-touch="pause"] button found');
+    }
+  } catch (error) {
+    notes.push(`real touches could not be performed: ${error && error.message ? error.message : error}`);
+  }
 }
 
 for (const [label, options, run] of [
@@ -229,5 +301,5 @@ for (const [label, options, run] of [
 }
 
 const ok = failure === '' && errors.length === 0;
-console.log(JSON.stringify({ tool: 'shots', mode, ok, out, files, notes, errors, failure }, null, 2));
+console.log(JSON.stringify({ tool: 'shots', mode, ok, out, files, notes, touchChecks, errors, failure }, null, 2));
 process.exit(ok ? 0 : 1);

@@ -12,7 +12,7 @@ import type { DebugFlags, Game, GameContext } from './types';
 export interface ContextOptions {
   canvas: HTMLCanvasElement;
   uiRoot: HTMLElement;
-  /** `?test=1`: manual stepping, fixed seeds, no pointer lock. */
+  /** Automation mode (opt-in, see GameContext.testMode): manual stepping, fixed seeds, no pointer lock. */
   testMode: boolean;
   /** Receives exceptions thrown by event handlers. */
   onEventError: (eventName: string, error: unknown) => void;
@@ -71,6 +71,7 @@ export function createContext(options: ContextOptions): CoreContext {
     settings,
     storage,
     rng: createRng(testMode ? 0x51a71c : (Date.now() ^ (Math.random() * 0x7fffffff)) >>> 0),
+    cosmeticRng: createRng(testMode ? 0xc05e71c : (Date.now() ^ (Math.random() * 0x7fffffff)) >>> 0),
     time: createTime(),
     mods: makeModifiers(),
     game: unset,

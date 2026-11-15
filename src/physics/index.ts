@@ -103,6 +103,7 @@ interface MutableBox {
   flags: number;
   surface: SurfaceType;
   tag: string;
+  decals: boolean;
   enabled: boolean;
 }
 
@@ -328,10 +329,11 @@ export function createCollisionWorld(): CollisionWorld {
     const dz = f[R_RZ];
     const su = f[R_SU];
     const sd = f[R_SD];
-    // Every step may borrow MIN_STEP_ADVANCE beyond the requested delta.
+    // Every step may borrow MIN_STEP_ADVANCE beyond the requested delta, rise by up to the step
+    // height and come down up to the snap reach lower than it started; the final snap adds one more.
     const pad = MIN_STEP_ADVANCE * (MAX_STEPS + 1) + 4 * SKIN;
-    const below = (sd > 0 ? 2 * sd : 0) + GROUND_PROBE + pad;
-    const above = (su > 0 ? su * (MAX_STEPS + 1) : 0) + pad;
+    const below = sd * (MAX_STEPS + 1) + GROUND_PROBE + pad;
+    const above = su * (MAX_STEPS + 1) + pad;
     f[Q_X0] = f[R_PX] - hw + (dx < 0 ? dx : 0) - pad;
     f[Q_X1] = f[R_PX] + hw + (dx > 0 ? dx : 0) + pad;
     f[Q_Z0] = f[R_PZ] - hw + (dz < 0 ? dz : 0) - pad;
@@ -552,8 +554,8 @@ export function createCollisionWorld(): CollisionWorld {
 
   /**
    * The body was just stopped by a low obstacle along `axis` (0 = X, 2 = Z): lift it by up to R_SU,
-   * carry the remaining horizontal move forward and drop it back down. Succeeds only when that gains
-   * ground along the blocked axis and ends standing on something; otherwise the body is restored.
+   * carry the remaining horizontal move forward and bring it back down. Succeeds only when that gains
+   * ground along the blocked axis; otherwise the body is restored.
    */
   const tryStep = (axis: number): boolean => {
     const out = res as MoveResult;
@@ -614,25 +616,24 @@ export function createCollisionWorld(): CollisionWorld {
       return false;
     }
 
-    // 3. Drop back onto whatever is below (never further than the lift plus the snap reach).
+    // 3. Come back down: onto the ledge, or onto whatever lies within the snap reach below the old
+    //    height. With nothing there (a low rim with a drop behind it, cleared in one stride) the body
+    //    hopped the obstacle and is left in mid-air at the height it came from, free to fall.
     f[R_DX] = 0;
     f[R_DY] = -(lift + f[R_SD]);
     f[R_DZ] = 0;
     sweep();
-    if (hitAxis !== 1) {
-      f[R_PX] = sx;
+    if (hitAxis === 1) {
+      applySweep();
+      const rise = f[R_PY] - sy;
+      if (rise > 0) out.stepped += rise;
+      else if (rise < -SKIN) out.snapped -= rise;
+      if (f[R_RY] < 0) f[R_RY] = 0;
+    } else {
       f[R_PY] = sy;
-      f[R_PZ] = sz;
-      return false;
     }
-    applySweep();
-
-    const rise = f[R_PY] - sy;
-    if (rise > 0) out.stepped += rise;
-    else if (rise < -SKIN) out.snapped -= rise;
     f[R_RX] = ax;
     f[R_RZ] = az;
-    if (f[R_RY] < 0) f[R_RY] = 0;
     if (sideAxis === 0) {
       out.hitX = true;
       out.wallBoxId = sideBox;
@@ -669,21 +670,30 @@ export function createCollisionWorld(): CollisionWorld {
     // Refuse to propagate garbage: a non-finite or absurd position is left alone and reported airborne.
     if (!(Math.abs(x) <= MAX_COORD && Math.abs(y) <= MAX_COORD && Math.abs(z) <= MAX_COORD)) return out;
 
-    let dx = delta.x;
-    let dy = delta.y;
-    let dz = delta.z;
-    dx = dx === dx ? (dx > MAX_DELTA ? MAX_DELTA : dx < -MAX_DELTA ? -MAX_DELTA : dx) : 0;
-    dy = dy === dy ? (dy > MAX_DELTA ? MAX_DELTA : dy < -MAX_DELTA ? -MAX_DELTA : dy) : 0;
-    dz = dz === dz ? (dz > MAX_DELTA ? MAX_DELTA : dz < -MAX_DELTA ? -MAX_DELTA : dz) : 0;
-    const su = stepUp > 0 ? (stepUp < MAX_STEP_HEIGHT ? stepUp : MAX_STEP_HEIGHT) : 0;
-    const sd = snapDown > 0 ? (snapDown < MAX_STEP_HEIGHT ? snapDown : MAX_STEP_HEIGHT) : 0;
+    // Clamp with Math.min / Math.max, never with `v > MAX ? MAX : v`: a conditional that selects
+    // between a raw double and a module constant makes the optimiser keep the value as a tagged
+    // number whenever it cannot fold the constant (as soon as a second world exists), and that boxes
+    // dx, dy and dz on the heap on every single call. NaN falls through both and is zeroed after.
+    let dx = Math.min(Math.max(delta.x, -MAX_DELTA), MAX_DELTA);
+    let dy = Math.min(Math.max(delta.y, -MAX_DELTA), MAX_DELTA);
+    let dz = Math.min(Math.max(delta.z, -MAX_DELTA), MAX_DELTA);
+    if (dx !== dx) dx = 0;
+    if (dy !== dy) dy = 0;
+    if (dz !== dz) dz = 0;
+    let su = Math.min(Math.max(stepUp, 0), MAX_STEP_HEIGHT);
+    let sd = Math.min(Math.max(snapDown, 0), MAX_STEP_HEIGHT);
+    if (su !== su) su = 0;
+    if (sd !== sd) sd = 0;
 
     if (gridDirty) rebuild();
     f[R_PX] = x;
     f[R_PY] = y;
     f[R_PZ] = z;
-    f[R_HW] = halfWidth > MIN_EXTENT ? halfWidth : MIN_EXTENT;
-    f[R_H] = height > MIN_EXTENT ? height : MIN_EXTENT;
+    // Degenerate or NaN body sizes fall back to the smallest extent (two stores, for the same reason).
+    f[R_HW] = MIN_EXTENT;
+    f[R_H] = MIN_EXTENT;
+    if (halfWidth > MIN_EXTENT) f[R_HW] = halfWidth;
+    if (height > MIN_EXTENT) f[R_H] = height;
     f[R_RX] = dx;
     f[R_RY] = dy;
     f[R_RZ] = dz;
@@ -750,7 +760,7 @@ export function createCollisionWorld(): CollisionWorld {
       // stairs. A move that travels upward is airborne by definition.
       if (dy <= 0) {
         f[R_DX] = 0;
-        f[R_DY] = -(sd > GROUND_PROBE ? sd : GROUND_PROBE);
+        f[R_DY] = -Math.max(sd, GROUND_PROBE);
         f[R_DZ] = 0;
         sweep();
         if (hitAxis === 1) {
@@ -946,8 +956,16 @@ export function createCollisionWorld(): CollisionWorld {
     if (b < 0) return false;
     const t = f[RAY_T];
     out.distance = t;
-    out.point.set(origin.x + dir.x * t, origin.y + dir.y * t, origin.z + dir.z * t);
-    out.normal.set(rayAxis === 0 ? raySign : 0, rayAxis === 1 ? raySign : 0, rayAxis === 2 ? raySign : 0);
+    // Plain field writes: a Vector3.set() call that the optimiser declines to inline would box its
+    // three arguments.
+    const point = out.point;
+    point.x = origin.x + dir.x * t;
+    point.y = origin.y + dir.y * t;
+    point.z = origin.z + dir.z * t;
+    const normal = out.normal;
+    normal.x = rayAxis === 0 ? raySign : 0;
+    normal.y = rayAxis === 1 ? raySign : 0;
+    normal.z = rayAxis === 2 ? raySign : 0;
     out.boxId = b;
     out.surface = (boxes[b] as MutableBox).surface;
     return true;
@@ -1074,7 +1092,20 @@ export function createCollisionWorld(): CollisionWorld {
       if (id === capacity) growStorage();
       const flags = desc.flags ?? COL.SOLID;
       const tag = desc.tag ?? '';
-      boxes.push({ id, minX, minY, minZ, maxX, maxY, maxZ, flags, surface: desc.surface ?? 'metal', tag, enabled: true });
+      boxes.push({
+        id,
+        minX,
+        minY,
+        minZ,
+        maxX,
+        maxY,
+        maxZ,
+        flags,
+        surface: desc.surface ?? 'metal',
+        tag,
+        decals: desc.decals ?? true,
+        enabled: true,
+      });
       bMinX[id] = minX;
       bMinY[id] = minY;
       bMinZ[id] = minZ;

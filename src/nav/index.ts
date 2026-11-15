@@ -8,10 +8,12 @@
  *     cell border separates the cells). The result is an 8-bit link mask per cell.
  *   - Flow field: bucketed integer Dijkstra (Dial) over the link masks, cheap enough to rebuild
  *     whenever the target changes cell. Sampling steers toward the farthest point of the downhill
- *     chain that can be walked to in a straight line (the target itself when it is visible), so
- *     agents cut corners smoothly instead of zig-zagging along the 8 grid directions.
- *   - Paths: A* plus string pulling with the same "wide" walkable-line test.
- *   - Hot queries keep their state in typed-array registers: nothing is allocated per call.
+ *     chain that can be walked to in a straight line with the agent's radius to spare (the target
+ *     itself when it is in plain view), so agents cut corners smoothly instead of zig-zagging along
+ *     the 8 grid directions, and never brush a wall corner on the way.
+ *   - Paths: A* with the same integer costs, then string pulling with the same "wide" line test.
+ *   - Hot queries keep their state in typed-array registers and write results field by field:
+ *     nothing is allocated per call, whatever the optimiser decides to inline.
  */
 import * as THREE from 'three';
 import { COL, ZONE_IDS } from '../core/constants';
@@ -38,7 +40,8 @@ const BUCKETS = COST_DIAG + 1;
 const UNREACHED = 0x3fffffff;
 
 const MAX_CANDIDATES = 4;
-const MAX_GRID_DIM = 2048;
+/** Largest grid edge in cells (the flow field keeps BUCKETS ints per cell: 19 MB at 512 x 512). */
+const MAX_GRID_DIM = 512;
 /** Vertical / horizontal tolerances of the build (metres). */
 const EPS_Y = 1e-3;
 const EPS_XZ = 1e-4;
@@ -51,6 +54,10 @@ const TARGET_SNAP_RADIUS = 4;
 const OFF_MESH_RADIUS = 3;
 const PATH_SNAP_RADIUS = 3;
 const ANNULUS_TRIES = 24;
+/** How far past a cell border (in cells) the flow aims when it sends an agent through its middle. */
+const PORTAL_OVERSHOOT = 0.05;
+/** Positions further than this many cells from the grid origin are treated as garbage. */
+const MAX_CELL_COORD = 1e9;
 
 // Scratch registers (indices into one Float64Array) for the hot queries.
 const L_AX = 0;
@@ -68,9 +75,12 @@ const REGISTER_COUNT = 9;
 const ANY_WALKABLE = 0;
 const FLOW_REACHABLE = 1;
 
-/** Binary min-heap of (key, cell) pairs on growable typed arrays (A* open list). */
+/**
+ * Binary min-heap of (key, cell) pairs on growable typed arrays (A* open list). Keys are small
+ * integers so that they cross the call boundary without being boxed.
+ */
 class MinHeap {
-  private keys = new Float64Array(1024);
+  private keys = new Int32Array(1024);
   private cells = new Int32Array(1024);
   size = 0;
 
@@ -80,7 +90,7 @@ class MinHeap {
 
   push(key: number, cell: number): void {
     if (this.size === this.keys.length) {
-      const k = new Float64Array(this.size * 2);
+      const k = new Int32Array(this.size * 2);
       k.set(this.keys);
       this.keys = k;
       const c = new Int32Array(this.size * 2);
@@ -157,7 +167,7 @@ export function createNavGrid(): NavGrid {
   const chain = new Int32Array(LOOKAHEAD);
 
   // A* scratch.
-  let gScore = new Float32Array(0);
+  let gScore = new Int32Array(0);
   let cameFrom = new Int32Array(0);
   let stamp = new Int32Array(0);
   let closed = new Uint8Array(0);
@@ -166,12 +176,21 @@ export function createNavGrid(): NavGrid {
   let cellPath = new Int32Array(256);
 
   const g = new Float64Array(REGISTER_COUNT);
+  let scanExact = false;
 
   const walk = (c: number): boolean => base[c] === 1 && blocked[c] === 0;
 
   const cellAt = (x: number, z: number): number => {
     const fx = (x - originX) * inv;
     const fz = (z - originZ) * inv;
+    if (!(fx >= 0 && fz >= 0 && fx < cols && fz < rows)) return -1;
+    return Math.floor(fz) * cols + Math.floor(fx);
+  };
+
+  /** Cell containing the position in (N_X, N_Z), or -1 outside the grid. */
+  const cellUnder = (): number => {
+    const fx = (g[N_X] - originX) * inv;
+    const fz = (g[N_Z] - originZ) * inv;
     if (!(fx >= 0 && fz >= 0 && fx < cols && fz < rows)) return -1;
     return Math.floor(fz) * cols + Math.floor(fx);
   };
@@ -241,34 +260,49 @@ export function createNavGrid(): NavGrid {
 
   /**
    * Nearest cell centre to (N_X, N_Z) within N_R metres that is walkable (ANY_WALKABLE) or walkable
-   * and connected to the flow target (FLOW_REACHABLE). The cell containing the point wins outright.
+   * and connected to the flow target (FLOW_REACHABLE). The cell containing the point wins outright;
+   * scanExact then says so (positions never travel through call arguments here: a helper taking
+   * coordinates would have them boxed whenever it is not inlined).
    */
   const nearestScan = (mode: number): number => {
     const fx = (g[N_X] - originX) * inv;
     const fz = (g[N_Z] - originZ) * inv;
-    if (!(fx === fx && fz === fz)) return -1;
+    scanExact = false;
+    // NaN, infinities and coordinates too large to count cells with have no nearest cell.
+    if (!(fx > -MAX_CELL_COORD && fx < MAX_CELL_COORD && fz > -MAX_CELL_COORD && fz < MAX_CELL_COORD)) return -1;
     const cx = Math.floor(fx);
     const cz = Math.floor(fz);
     if (cx >= 0 && cz >= 0 && cx < cols && cz < rows) {
       const c = cz * cols + cx;
-      if (walk(c) && (mode === ANY_WALKABLE || dist[c] < UNREACHED)) return c;
+      if (walk(c) && (mode === ANY_WALKABLE || dist[c] < UNREACHED)) {
+        scanExact = true;
+        return c;
+      }
     }
     const maxCells = g[N_R] * inv;
     if (!(maxCells > 0)) return -1;
-    const rings = Math.ceil(maxCells) + 1;
+    // Rings of cells around the point, clipped to the grid: only the rings that touch it are visited,
+    // so a far-away point or an absurd radius costs at most one pass over the grid.
+    const lastCol = cols - 1;
+    const lastRow = rows - 1;
+    const first = Math.max(1, -cx, cx - lastCol, -cz, cz - lastRow);
+    const last = Math.min(Math.ceil(maxCells) + 1, Math.max(cx, lastCol - cx, cz, lastRow - cz));
     let best = -1;
     let bestD = maxCells * maxCells;
-    for (let r = 1; r <= rings; r++) {
+    for (let r = first; r <= last; r++) {
       // No centre of ring r can be closer than r - 0.5 cells.
       const lower = r - 0.5;
       if (lower * lower > bestD) break;
-      for (let dz = -r; dz <= r; dz++) {
-        const nz = cz + dz;
-        if (nz < 0 || nz >= rows) continue;
-        const edge = dz === -r || dz === r;
-        for (let dx = -r; dx <= r; dx += edge ? 1 : 2 * r) {
-          const nx = cx + dx;
-          if (nx < 0 || nx >= cols) continue;
+      const z0 = cz - r > 0 ? cz - r : 0;
+      const z1 = cz + r < lastRow ? cz + r : lastRow;
+      const x0 = cx - r > 0 ? cx - r : 0;
+      const x1 = cx + r < lastCol ? cx + r : lastCol;
+      for (let nz = z0; nz <= z1; nz++) {
+        // Top and bottom rows of the ring are scanned in full, the rows between only at both ends.
+        const full = nz === cz - r || nz === cz + r;
+        const stride = full ? 1 : 2 * r;
+        for (let nx = full ? x0 : cx - r; nx <= x1; nx += stride) {
+          if (nx < 0) continue;
           const c = nz * cols + nx;
           if (!walk(c) || (mode !== ANY_WALKABLE && dist[c] >= UNREACHED)) continue;
           const ox = nx + 0.5 - fx;
@@ -449,9 +483,10 @@ export function createNavGrid(): NavGrid {
     return flowValid;
   };
 
-  const pushPoint = (out: NavPath, x: number, y: number, z: number): void => {
+  /** Next free waypoint of a path buffer (grown on demand); the caller fills it in. */
+  const nextPoint = (out: NavPath): THREE.Vector3 => {
     if (out.count >= out.points.length) out.points.push(new THREE.Vector3());
-    (out.points[out.count++] as THREE.Vector3).set(x, y, z);
+    return out.points[out.count++] as THREE.Vector3;
   };
 
   const grid: NavGrid = {
@@ -482,7 +517,7 @@ export function createNavGrid(): NavGrid {
       dist = new Int32Array(n).fill(UNREACHED);
       next = new Int32Array(n).fill(-1);
       bucketData = new Int32Array(n * BUCKETS);
-      gScore = new Float32Array(n);
+      gScore = new Int32Array(n);
       cameFrom = new Int32Array(n);
       stamp = new Int32Array(n);
       closed = new Uint8Array(n);
@@ -803,10 +838,20 @@ export function createNavGrid(): NavGrid {
 
     cellAt,
     cellCenter(cell: number, out: THREE.Vector3): THREE.Vector3 {
-      if (!(cell >= 0 && cell < cellCount)) return out.set(originX, 0, originZ);
+      // Plain field writes throughout this file: Vector3.set() boxes its arguments whenever the
+      // optimiser declines to inline it.
+      if (!(cell >= 0 && cell < cellCount)) {
+        out.x = originX;
+        out.y = 0;
+        out.z = originZ;
+        return out;
+      }
       const cx = cell % cols;
       const cz = (cell - cx) / cols;
-      return out.set(originX + (cx + 0.5) * cellSize, height[cell], originZ + (cz + 0.5) * cellSize);
+      out.x = originX + (cx + 0.5) * cellSize;
+      out.y = height[cell];
+      out.z = originZ + (cz + 0.5) * cellSize;
+      return out;
     },
     isWalkable(x: number, z: number): boolean {
       const c = cellAt(x, z);
@@ -874,7 +919,7 @@ export function createNavGrid(): NavGrid {
       const cell = nearestScan(ANY_WALKABLE);
       // A target far from any floor (falling, out of bounds) keeps the last valid field alive.
       if (cell < 0) return false;
-      if (cellAt(target.x, target.z) === cell) {
+      if (scanExact) {
         g[F_AIMX] = target.x;
         g[F_AIMZ] = target.z;
       } else {
@@ -888,7 +933,9 @@ export function createNavGrid(): NavGrid {
       return true;
     },
     sampleFlow(pos: Vec3Like, out: THREE.Vector3): boolean {
-      out.set(0, 0, 0);
+      out.x = 0;
+      out.y = 0;
+      out.z = 0;
       if (!ensureFlow()) return false;
       const x = pos.x;
       const z = pos.z;
@@ -936,7 +983,7 @@ export function createNavGrid(): NavGrid {
             cursor = n;
           }
           if (count === 0) return false;
-          let pick = 0; // the next cell is always directly walkable
+          let pick = 0;
           if (count > 1) {
             let hi = count - 1;
             let aim = chain[hi];
@@ -960,29 +1007,53 @@ export function createNavGrid(): NavGrid {
             }
           }
           const aim = chain[pick];
-          if (aim === flowTarget) {
-            tx = g[F_AIMX];
-            tz = g[F_AIMZ];
+          const ax = aim % cols;
+          const az = (aim - ax) / cols;
+          tx = originX + (ax + 0.5) * cellSize;
+          tz = originZ + (az + 0.5) * cellSize;
+          if (pick > 0) {
+            if (aim === flowTarget) {
+              tx = g[F_AIMX];
+              tz = g[F_AIMZ];
+            }
           } else {
-            const ax = aim % cols;
-            tx = originX + (ax + 0.5) * cellSize;
-            tz = originZ + ((aim - ax) / cols + 0.5) * cellSize;
+            // Only the next cell is left. Its centre is fine when it can be walked to with clearance
+            // (the target, when it lies in that cell, is already known not to be). Otherwise the
+            // agent sits too close to a corner for any straight shot: cross into the next cell
+            // through the middle of the shared border (the shared corner for a diagonal step).
+            let direct = aim !== flowTarget;
+            if (direct) {
+              g[L_BX] = tx;
+              g[L_BZ] = tz;
+              direct = lineWalk(true);
+            }
+            if (!direct) {
+              const cx = c % cols;
+              const cz = (c - cx) / cols;
+              const reach = (0.5 + PORTAL_OVERSHOOT) * cellSize;
+              tx = originX + (cx + 0.5) * cellSize + (ax - cx) * reach;
+              tz = originZ + (cz + 0.5) * cellSize + (az - cz) * reach;
+            }
           }
         }
       }
       const dx = tx - x;
       const dz = tz - z;
       const len = Math.sqrt(dx * dx + dz * dz);
-      if (len > 1e-6) out.set(dx / len, 0, dz / len);
+      if (len > 1e-6) {
+        out.x = dx / len;
+        out.z = dz / len;
+      }
       return true;
     },
     flowDistance(pos: Vec3Like): number {
       if (!ensureFlow()) return Infinity;
-      let c = cellAt(pos.x, pos.z);
+      // On the mesh: the cell under the position (Infinity when it cannot reach the target). Off the
+      // mesh: measured from the cell sampleFlow steers back to.
+      g[N_X] = pos.x;
+      g[N_Z] = pos.z;
+      let c = cellUnder();
       if (c < 0 || !walk(c)) {
-        // Off the mesh: measured from the cell sampleFlow steers back to.
-        g[N_X] = pos.x;
-        g[N_Z] = pos.z;
         g[N_R] = OFF_MESH_RADIUS;
         c = nearestScan(FLOW_REACHABLE);
       }
@@ -997,22 +1068,23 @@ export function createNavGrid(): NavGrid {
       g[N_R] = PATH_SNAP_RADIUS;
       const start = nearestScan(ANY_WALKABLE);
       if (start < 0) return false;
+      const startWasExact = scanExact;
       g[N_X] = to.x;
       g[N_Z] = to.z;
       const goal = nearestScan(ANY_WALKABLE);
       if (goal < 0) return false;
+      const goalWasExact = scanExact;
       ensureRegions();
       if (region[start] !== region[goal]) return false;
 
-      // --- A* over the open links (octile heuristic). ---
+      // --- A* over the open links: the integer step costs of the flow field, octile heuristic. ---
       if (++generation >= UNREACHED) {
         stamp.fill(0);
         generation = 1;
       }
       const goalX = goal % cols;
       const goalZ = (goal - goalX) / cols;
-      const diagonal = cellSize * Math.SQRT2;
-      const extra = Math.SQRT2 - 1;
+      const extra = COST_DIAG - COST_ORTH;
       heap.clear();
       stamp[start] = generation;
       closed[start] = 0;
@@ -1040,16 +1112,18 @@ export function createNavGrid(): NavGrid {
           if (stamp[nb] !== generation) {
             stamp[nb] = generation;
             closed[nb] = 0;
-            gScore[nb] = Infinity;
+            gScore[nb] = UNREACHED;
           }
           if (closed[nb] === 1) continue;
-          const cost = gc + (k < 4 ? cellSize : diagonal);
-          if (cost >= gScore[nb] - 1e-4) continue;
+          const cost = gc + (k < 4 ? COST_ORTH : COST_DIAG);
+          if (cost >= gScore[nb]) continue;
           gScore[nb] = cost;
           cameFrom[nb] = c;
-          const hx = Math.abs(cx + dx - goalX);
-          const hz = Math.abs(cz + dz - goalZ);
-          heap.push(cost + ((hx > hz ? hx : hz) + extra * (hx < hz ? hx : hz)) * cellSize, nb);
+          let hx = cx + dx - goalX;
+          let hz = cz + dz - goalZ;
+          if (hx < 0) hx = -hx;
+          if (hz < 0) hz = -hz;
+          heap.push(cost + COST_ORTH * (hx > hz ? hx : hz) + extra * (hx < hz ? hx : hz), nb);
         }
       }
       if (!found) return false;
@@ -1061,43 +1135,46 @@ export function createNavGrid(): NavGrid {
       let write = length;
       for (let c = goal; c !== -1; c = cameFrom[c]) cellPath[--write] = c;
 
-      // --- String pulling. Candidates are the start, every cell centre of the path and the end;
-      //     consecutive candidates always see each other, so a waypoint is only kept where the
-      //     straight line from the last kept one breaks. ---
-      const startExact = cellAt(from.x, from.z) === start;
-      const goalExact = cellAt(to.x, to.z) === goal;
+      // --- String pulling. Candidates are every cell centre of the path, then the end point. From
+      //     the last kept point (the anchor) take the end if it is in plain view, otherwise the
+      //     farthest candidate that is, found by bisection: the candidate right after the anchor is
+      //     always visible, so every round keeps one waypoint and moves on. ---
       const startCX = start % cols;
-      let anchorX = startExact ? from.x : originX + (startCX + 0.5) * cellSize;
-      let anchorZ = startExact ? from.z : originZ + ((start - startCX) / cols + 0.5) * cellSize;
-      const endX = goalExact ? to.x : originX + (goalX + 0.5) * cellSize;
-      const endZ = goalExact ? to.z : originZ + (goalZ + 0.5) * cellSize;
-      let prevX = anchorX;
-      let prevZ = anchorZ;
-      let prevCell = start;
-      for (let i = 0; i <= length; i++) {
-        let px = endX;
-        let pz = endZ;
-        let cell = goal;
-        if (i < length) {
-          cell = cellPath[i];
+      g[L_AX] = startWasExact ? from.x : originX + (startCX + 0.5) * cellSize;
+      g[L_AZ] = startWasExact ? from.z : originZ + ((start - startCX) / cols + 0.5) * cellSize;
+      const endX = goalWasExact ? to.x : originX + (goalX + 0.5) * cellSize;
+      const endZ = goalWasExact ? to.z : originZ + (goalZ + 0.5) * cellSize;
+      let anchor = -1;
+      for (;;) {
+        g[L_BX] = endX;
+        g[L_BZ] = endZ;
+        if (lineWalk(true)) break;
+        let lo = anchor + 1;
+        let hi = length;
+        while (hi - lo > 1) {
+          const mid = (lo + hi) >> 1;
+          const cell = cellPath[mid];
           const cx = cell % cols;
-          px = originX + (cx + 0.5) * cellSize;
-          pz = originZ + ((cell - cx) / cols + 0.5) * cellSize;
+          g[L_BX] = originX + (cx + 0.5) * cellSize;
+          g[L_BZ] = originZ + ((cell - cx) / cols + 0.5) * cellSize;
+          if (lineWalk(true)) lo = mid;
+          else hi = mid;
         }
-        g[L_AX] = anchorX;
-        g[L_AZ] = anchorZ;
-        g[L_BX] = px;
-        g[L_BZ] = pz;
-        if (!lineWalk(true)) {
-          pushPoint(out, prevX, height[prevCell], prevZ);
-          anchorX = prevX;
-          anchorZ = prevZ;
-        }
-        prevX = px;
-        prevZ = pz;
-        prevCell = cell;
+        const cell = cellPath[lo];
+        const cx = cell % cols;
+        const corner = nextPoint(out);
+        corner.x = originX + (cx + 0.5) * cellSize;
+        corner.y = height[cell];
+        corner.z = originZ + ((cell - cx) / cols + 0.5) * cellSize;
+        g[L_AX] = corner.x;
+        g[L_AZ] = corner.z;
+        anchor = lo;
+        // The goal cell's own centre always sees the end point: the next round ends the loop.
       }
-      pushPoint(out, endX, height[goal], endZ);
+      const last = nextPoint(out);
+      last.x = endX;
+      last.y = height[goal];
+      last.z = endZ;
       return true;
     },
     randomPointInAnnulus(center: Vec3Like, minRadius: number, maxRadius: number, rng: Rng, out: THREE.Vector3): boolean {
@@ -1114,7 +1191,9 @@ export function createNavGrid(): NavGrid {
         const radius = Math.sqrt(rng.range(lo * lo, hi * hi));
         let x = center.x + Math.cos(angle) * radius;
         let z = center.z + Math.sin(angle) * radius;
-        const c = cellAt(x, z);
+        g[N_X] = x;
+        g[N_Z] = z;
+        const c = cellUnder();
         if (c < 0 || !walk(c) || region[c] !== region[origin]) continue;
         if (eff[c] !== ALL_LINKS) {
           // Next to an obstacle or a ledge only the cell centre is known to have clearance.
@@ -1124,7 +1203,9 @@ export function createNavGrid(): NavGrid {
           const d = Math.hypot(x - center.x, z - center.z);
           if (d < lo || d > hi) continue;
         }
-        out.set(x, height[c], z);
+        out.x = x;
+        out.y = height[c];
+        out.z = z;
         return true;
       }
       return false;

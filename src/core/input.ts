@@ -34,6 +34,16 @@ const LOCK_SETTLE_MS = 80;
 const MAX_LOOK_PER_EVENT = 1.0;
 const TOUCH_MOUSE_GUARD_MS = 800;
 const MAX_LOCK_FAILURES = 3;
+/** Clicks that only re-acquire a lost pointer lock (and therefore do not fire) before clicks act normally again. */
+const MAX_RELOCK_SWALLOWS = 2;
+/** Wheel: accumulated delta (pixels) for one weapon step, minimum time between steps, and the gesture gap. */
+const WHEEL_STEP = 80;
+const WHEEL_STEP_MS = 140;
+const WHEEL_GESTURE_GAP_MS = 250;
+/** A gamepad axis only counts once it has been seen near its centre (wheels and pedals rest at +-1). */
+const PAD_AXIS_ARM = 0.25;
+/** Stick deflection that counts as "the player is using the pad" when crossed upward. */
+const PAD_ACTIVE_STICK = 0.5;
 
 // --- bindings -------------------------------------------------------------------------------------
 const KEY_BINDINGS: Readonly<Record<string, readonly InputAction[]>> = {
@@ -89,10 +99,10 @@ const PAD_BINDINGS: readonly (readonly InputAction[])[] = [
   ['pause'], // 9 Start
   [], // 10 L3 (sprint latch, handled separately)
   ['melee'], // 11 R3
-  ['overclock', 'uiUp', 'perk2'], // 12 D-pad up
+  ['overclock', 'uiUp'], // 12 D-pad up
   ['weaponPrev', 'uiDown'], // 13 D-pad down
-  ['uiLeft', 'perk1'], // 14 D-pad left
-  ['uiRight', 'perk3'], // 15 D-pad right
+  ['uiLeft'], // 14 D-pad left (navigation only: perks are X / Y / B)
+  ['uiRight'], // 15 D-pad right
 ];
 const PAD_L3 = 10;
 
@@ -187,16 +197,56 @@ INPUT_ACTIONS.forEach((action, i) => {
   ACTION_INDEX[action] = i;
 });
 
+function asElement(target: EventTarget | null): HTMLElement | null {
+  return typeof HTMLElement !== 'undefined' && target instanceof HTMLElement ? target : null;
+}
+
+/** Text entry: the game ignores the key completely. */
 function isEditable(target: EventTarget | null): boolean {
-  if (!(target instanceof HTMLElement)) return false;
-  const tag = target.tagName;
-  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target.isContentEditable;
+  const el = asElement(target);
+  if (!el) return false;
+  if (el.isContentEditable || el.tagName === 'TEXTAREA') return true;
+  if (el.tagName !== 'INPUT') return false;
+  const type = (el.getAttribute('type') ?? 'text').toLowerCase();
+  return !['range', 'checkbox', 'radio', 'button', 'submit', 'reset'].includes(type);
 }
 
 function isInteractive(target: EventTarget | null): boolean {
-  if (!(target instanceof HTMLElement)) return false;
-  return target.closest('button,a,input,select,textarea,[role="button"],[role="slider"],[tabindex]') !== null;
+  const el = asElement(target);
+  return el !== null && el.closest('button,a,input,select,textarea,[role="button"],[role="slider"],[tabindex]') !== null;
 }
+
+/** Controls whose native arrow-key behaviour must survive (sliders, selects, radio groups). */
+function usesArrowKeys(target: EventTarget | null): boolean {
+  const el = asElement(target);
+  if (!el) return false;
+  const tag = el.tagName;
+  return tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA' || el.getAttribute('role') === 'slider';
+}
+
+/** Touch-only device (phone / tablet without a mouse): the first prompts must be touch glyphs. */
+function startsOnTouch(): boolean {
+  try {
+    return (
+      typeof matchMedia === 'function' &&
+      matchMedia('(pointer: coarse)').matches &&
+      !matchMedia('(any-pointer: fine)').matches
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** True while the browser considers a user gesture active (pointer lock needs one). */
+function userActive(): boolean {
+  try {
+    return typeof navigator !== 'undefined' && navigator.userActivation?.isActive === true;
+  } catch {
+    return false;
+  }
+}
+
+type LockRequest = (options?: { unadjustedMovement?: boolean }) => unknown;
 
 function applyDeadzone(x: number, y: number, out: { x: number; y: number }): void {
   const len = Math.sqrt(x * x + y * y);
@@ -218,12 +268,10 @@ export function createInput(options: InputOptions): Input {
   const prev = new Uint8Array(ACTION_COUNT);
   const pressed = new Uint8Array(ACTION_COUNT);
   const released = new Uint8Array(ACTION_COUNT);
-  const analog = new Float32Array(ACTION_COUNT);
   const latchPressed = new Uint8Array(ACTION_COUNT);
   const latchReleased = new Uint8Array(ACTION_COUNT);
   const keyHeld = new Uint8Array(ACTION_COUNT); // number of keys/buttons holding the action
   const padHeld = new Uint8Array(ACTION_COUNT);
-  const padAnalog = new Float32Array(ACTION_COUNT);
   const virtualHeld = new Uint8Array(ACTION_COUNT);
   const virtualTap = new Uint8Array(ACTION_COUNT);
   const virtualTimer = new Float32Array(ACTION_COUNT);
@@ -239,16 +287,24 @@ export function createInput(options: InputOptions): Input {
   let lookYaw = 0;
   let lookPitch = 0;
 
-  let device: InputDevice = 'keyboardMouse';
-  let lookMode: LookMode = 'free';
+  let device: InputDevice = startsOnTouch() ? 'touch' : 'keyboardMouse';
+  let lookMode: LookMode = device === 'touch' ? 'touch' : 'free';
   let wantsCapture = false;
   let locked = false;
   let everLocked = false;
   let lockFailures = 0;
   let lockDisabled = testMode || typeof canvas.requestPointerLock !== 'function';
+  /** Raw (unaccelerated) mouse input is requested until a browser says it does not support it. */
+  let rawMouse = true;
+  /** Reports the failure of the lock attempt in flight (promise rejection or 'pointerlockerror', whichever comes first). */
+  let pendingLockFail: (() => void) | null = null;
+  let relockSwallows = 0;
   let lastLockAttempt = -Infinity;
   let lastLockChange = -Infinity;
   let lastTouchTime = -Infinity;
+  let wheelAccum = 0;
+  let lastWheelEvent = -Infinity;
+  let lastWheelStep = -Infinity;
 
   // Free-look pointer tracking (normalised canvas coordinates).
   let pointerInside = false;
@@ -265,6 +321,12 @@ export function createInput(options: InputOptions): Input {
   let padMoveY = 0;
   let padStickUiX = 0;
   let padStickUiY = 0;
+  /** Per-axis flag: the axis was seen near its centre at least once. */
+  const padAxisArmed = new Uint8Array(4);
+  /** Bit mask of the pad buttons that were down in the previous poll (device switches on edges only). */
+  let padPrevButtons = 0;
+  let padPrevMoveMag = 0;
+  let padPrevLookMag = 0;
 
   const nowMs = (): number => (typeof performance !== 'undefined' ? performance.now() : Date.now());
 
@@ -296,19 +358,57 @@ export function createInput(options: InputOptions): Input {
     refreshLookMode();
   };
 
-  const tryLock = (): void => {
-    if (lockDisabled || locked || !wantsCapture || device === 'touch') return;
+  /**
+   * Ask for pointer lock. `fromGesture` = called inside a real click on the canvas. A request made
+   * without user activation (a gamepad-started run, a frame callback) is always refused by the browser
+   * and says nothing about whether locking works here, so it never counts as a failure.
+   * Returns true when a request was actually issued.
+   */
+  const tryLock = (fromGesture: boolean): boolean => {
+    if (lockDisabled || locked || !wantsCapture || device !== 'keyboardMouse') return false;
     const t = nowMs();
-    if (t - lastLockAttempt < LOCK_RETRY_MS) return;
+    if (t - lastLockAttempt < LOCK_RETRY_MS) return false;
     lastLockAttempt = t;
-    try {
-      const result = canvas.requestPointerLock() as unknown;
-      if (result && typeof (result as Promise<void>).catch === 'function') {
-        (result as Promise<void>).catch(onLockFailed);
+    const counted = fromGesture || userActive();
+    let settled = false;
+    const fail = (): void => {
+      // The promise rejection and the 'pointerlockerror' event both report the same attempt: count once.
+      if (settled) return;
+      settled = true;
+      if (pendingLockFail === fail) pendingLockFail = null;
+      if (counted) onLockFailed();
+      else refreshLookMode();
+    };
+    pendingLockFail = fail;
+    const request = canvas.requestPointerLock.bind(canvas) as unknown as LockRequest;
+    const attempt = (raw: boolean): void => {
+      let result: unknown;
+      try {
+        result = raw ? request({ unadjustedMovement: true }) : request();
+      } catch {
+        fail();
+        return;
       }
-    } catch {
-      onLockFailed();
-    }
+      const promise = result as Promise<void> | undefined;
+      if (!promise || typeof promise.then !== 'function') return;
+      promise.then(
+        () => {
+          settled = true;
+          if (pendingLockFail === fail) pendingLockFail = null;
+        },
+        (error: unknown) => {
+          // Raw input not supported here: ask again without it (same attempt, not a failure).
+          if (raw && (error as { name?: string } | null)?.name === 'NotSupportedError') {
+            rawMouse = false;
+            if (!settled && !locked && wantsCapture) attempt(false);
+            return;
+          }
+          fail();
+        },
+      );
+    };
+    attempt(rawMouse);
+    return true;
   };
 
   const onPointerLockChange = (): void => {
@@ -319,6 +419,8 @@ export function createInput(options: InputOptions): Input {
     if (locked) {
       everLocked = true;
       lockFailures = 0;
+      relockSwallows = 0;
+      pendingLockFail = null;
       events.emit('input:capture', { captured: true, intentional: true });
     } else {
       // Lost while gameplay still wanted it = the user or the browser took it (Esc, alt-tab).
@@ -330,7 +432,7 @@ export function createInput(options: InputOptions): Input {
   };
 
   const onPointerLockError = (): void => {
-    onLockFailed();
+    if (pendingLockFail) pendingLockFail();
   };
 
   // --- keyboard -------------------------------------------------------------------------------
@@ -358,11 +460,18 @@ export function createInput(options: InputOptions): Input {
     const actions = KEY_BINDINGS[e.code];
     if (!modifier) {
       const functionKey = /^F\d{1,2}$/.test(e.code);
-      const scrollKey = e.code === 'Space' || e.code.startsWith('Arrow');
       if (e.code !== 'Escape' && !functionKey) {
-        // While gameplay owns the input every key is ours; in menus only stop page scrolling and
-        // leave focused buttons/sliders their native keys.
-        if (wantsCapture || (scrollKey && !isInteractive(e.target))) e.preventDefault();
+        // While gameplay owns the input every key is ours. In menus: arrows must never scroll the page
+        // (or the page that embeds us) — except on sliders / selects, which need them — and Space must
+        // keep activating a focused button.
+        const arrow = e.code.startsWith('Arrow');
+        if (
+          wantsCapture ||
+          (arrow && !usesArrowKeys(e.target)) ||
+          (e.code === 'Space' && !isInteractive(e.target))
+        ) {
+          e.preventDefault();
+        }
       }
     }
     if (!actions || modifier || e.repeat || heldCodes.has(e.code)) return;
@@ -391,7 +500,15 @@ export function createInput(options: InputOptions): Input {
     setDevice('keyboardMouse');
     if (!wantsCapture) return;
     if (e.button !== 0) e.preventDefault();
-    if (!locked) tryLock();
+    if (!locked) {
+      const issued = tryLock(true);
+      // A click that only re-acquires a lost pointer lock must not fire the weapon. If re-locking keeps
+      // failing the clicks act normally again (free look).
+      if (issued && everLocked && relockSwallows < MAX_RELOCK_SWALLOWS) {
+        relockSwallows++;
+        return;
+      }
+    }
     if (heldButtons.has(e.button)) return;
     heldButtons.add(e.button);
     pressActions(MOUSE_BINDINGS[e.button]);
@@ -404,6 +521,8 @@ export function createInput(options: InputOptions): Input {
 
   const onMouseMove = (e: MouseEvent): void => {
     if (fromTouch()) return;
+    // A button released outside the frame never sends its mouseup here: do not keep firing.
+    if (e.buttons === 0 && heldButtons.size > 0) releaseHeldMouse();
     const mx = Number.isFinite(e.movementX) ? e.movementX : 0;
     const my = Number.isFinite(e.movementY) ? e.movementY : 0;
     // Browsers dispatch synthetic zero-movement mousemoves after style/layout changes: those must
@@ -434,8 +553,18 @@ export function createInput(options: InputOptions): Input {
   const onWheel = (e: WheelEvent): void => {
     if (!wantsCapture) return;
     e.preventDefault();
-    if (e.deltaY === 0) return;
-    latchPressed[ACTION_INDEX[e.deltaY > 0 ? 'weaponNext' : 'weaponPrev']] = 1;
+    if (e.deltaY === 0 || !Number.isFinite(e.deltaY)) return;
+    // Trackpads and free-spinning wheels send dozens of small events per gesture: accumulate to one
+    // weapon step per notch-sized amount, with a minimum gap between steps.
+    const t = nowMs();
+    if (t - lastWheelEvent > WHEEL_GESTURE_GAP_MS) wheelAccum = 0;
+    lastWheelEvent = t;
+    wheelAccum += e.deltaY * (e.deltaMode === 1 ? 40 : e.deltaMode === 2 ? 400 : 1);
+    if (Math.abs(wheelAccum) >= WHEEL_STEP && t - lastWheelStep >= WHEEL_STEP_MS) {
+      latchPressed[ACTION_INDEX[wheelAccum > 0 ? 'weaponNext' : 'weaponPrev']] = 1;
+      wheelAccum = 0;
+      lastWheelStep = t;
+    }
     setDevice('keyboardMouse');
   };
 
@@ -475,9 +604,13 @@ export function createInput(options: InputOptions): Input {
   };
 
   // --- gamepad --------------------------------------------------------------------------------
+  const readAxis = (pad: Gamepad, index: number): number => {
+    const v = pad.axes[index];
+    return padAxisArmed[index] === 1 && typeof v === 'number' && Number.isFinite(v) ? v : 0;
+  };
+
   const pollGamepad = (realDt: number): void => {
     padHeld.fill(0);
-    padAnalog.fill(0);
     padMoveX = 0;
     padMoveY = 0;
     padStickUiX = 0;
@@ -489,17 +622,27 @@ export function createInput(options: InputOptions): Input {
     } catch {
       return;
     }
+    // Only standard-mapping pads count: wheels, flight sticks, pedals and odd receivers report other
+    // layouts and axes that rest at +-1.
     let pad: Gamepad | null = null;
-    if (padIndex >= 0 && pads[padIndex] && pads[padIndex]?.connected) pad = pads[padIndex] ?? null;
+    const current = padIndex >= 0 ? (pads[padIndex] ?? null) : null;
+    if (current && current.connected && current.mapping === 'standard') pad = current;
     if (!pad) {
+      const previous = padIndex;
       padIndex = -1;
       for (let i = 0; i < pads.length; i++) {
         const candidate = pads[i];
-        if (candidate && candidate.connected && candidate.buttons.length >= 10) {
+        if (candidate && candidate.connected && candidate.mapping === 'standard' && candidate.buttons.length >= 10) {
           pad = candidate;
           padIndex = i;
           break;
         }
+      }
+      if (padIndex !== previous) {
+        padAxisArmed.fill(0);
+        padPrevButtons = 0;
+        padPrevMoveMag = 0;
+        padPrevLookMag = 0;
       }
     }
     if (!pad) {
@@ -507,7 +650,16 @@ export function createInput(options: InputOptions): Input {
       return;
     }
 
-    let active = false;
+    // An axis contributes only after it was seen near its centre once.
+    for (let a = 0; a < 4; a++) {
+      const v = pad.axes[a];
+      if (typeof v === 'number' && Math.abs(v) < PAD_AXIS_ARM) padAxisArmed[a] = 1;
+    }
+
+    // The pad becomes the active device on EDGES only (a button going down, a stick pushed past half
+    // way) — never from a held level, which would fight the keyboard for the device every frame.
+    let edge = false;
+    let buttonsNow = 0;
     const buttons = pad.buttons;
     for (let b = 0; b < PAD_BINDINGS.length && b < buttons.length; b++) {
       const button = buttons[b];
@@ -516,28 +668,26 @@ export function createInput(options: InputOptions): Input {
       const value = button.value ?? (button.pressed ? 1 : 0);
       const isDown = isTrigger ? value > PAD_TRIGGER_THRESHOLD : button.pressed;
       if (!isDown) continue;
-      active = true;
-      for (const action of PAD_BINDINGS[b] as readonly InputAction[]) {
-        const i = ACTION_INDEX[action];
-        padHeld[i] = 1;
-        padAnalog[i] = Math.max(padAnalog[i] as number, isTrigger ? value : 1);
-      }
+      buttonsNow |= 1 << b;
+      for (const action of PAD_BINDINGS[b] as readonly InputAction[]) padHeld[ACTION_INDEX[action]] = 1;
     }
+    if ((buttonsNow & ~padPrevButtons) !== 0) edge = true;
+    const l3 = (buttonsNow & (1 << PAD_L3)) !== 0;
+    padPrevButtons = buttonsNow;
 
     // Left stick: movement (y axis is down-positive on gamepads).
-    applyDeadzone(pad.axes[0] ?? 0, pad.axes[1] ?? 0, stick);
+    applyDeadzone(readAxis(pad, 0), readAxis(pad, 1), stick);
     padMoveX = stick.x;
     padMoveY = -stick.y;
     padStickUiX = stick.x;
     padStickUiY = stick.y;
     const moveMag = Math.sqrt(stick.x * stick.x + stick.y * stick.y);
-    if (moveMag > 0.5) active = true;
+    if (moveMag > PAD_ACTIVE_STICK && padPrevMoveMag <= PAD_ACTIVE_STICK) edge = true;
+    padPrevMoveMag = moveMag;
 
     // L3 toggles a sprint latch that holds while the stick stays pushed.
-    const l3 = buttons[PAD_L3]?.pressed ?? false;
     if (l3 && !padPrevL3) padSprintLatch = !padSprintLatch;
     padPrevL3 = l3;
-    if (l3) active = true;
     if (moveMag < 0.35) padSprintLatch = false;
     if (padSprintLatch) padHeld[ACTION_INDEX.sprint] = 1;
 
@@ -548,19 +698,18 @@ export function createInput(options: InputOptions): Input {
     if (padStickUiX > 0.6) padHeld[ACTION_INDEX.uiRight] = 1;
 
     // Right stick: look, with a response curve for fine aim.
-    applyDeadzone(pad.axes[2] ?? 0, pad.axes[3] ?? 0, stick);
+    applyDeadzone(readAxis(pad, 2), readAxis(pad, 3), stick);
     const lookMag = Math.sqrt(stick.x * stick.x + stick.y * stick.y);
-    if (lookMag > 0) {
-      if (lookMag > 0.5) active = true;
-      if (wantsCapture && (device === 'gamepad' || active)) {
-        const curve = 0.35 + 0.65 * lookMag;
-        const sens = settings.data.sensitivity;
-        lookYaw -= stick.x * curve * PAD_YAW_RATE * sens * realDt;
-        lookPitch -= stick.y * curve * PAD_PITCH_RATE * sens * realDt * (settings.data.invertY ? -1 : 1);
-      }
+    if (lookMag > PAD_ACTIVE_STICK && padPrevLookMag <= PAD_ACTIVE_STICK) edge = true;
+    padPrevLookMag = lookMag;
+    if (lookMag > 0 && wantsCapture && (device === 'gamepad' || edge)) {
+      const curve = 0.35 + 0.65 * lookMag;
+      const sens = settings.data.sensitivity;
+      lookYaw -= stick.x * curve * PAD_YAW_RATE * sens * realDt;
+      lookPitch -= stick.y * curve * PAD_PITCH_RATE * sens * realDt * (settings.data.invertY ? -1 : 1);
     }
 
-    if (active) setDevice('gamepad');
+    if (edge) setDevice('gamepad');
   };
 
   // --- listeners ------------------------------------------------------------------------------
@@ -591,9 +740,6 @@ export function createInput(options: InputOptions): Input {
     justReleased(action: InputAction): boolean {
       return edgesVisible && released[ACTION_INDEX[action]] === 1;
     },
-    value(action: InputAction): number {
-      return analog[ACTION_INDEX[action]] as number;
-    },
     get moveX(): number {
       return moveX;
     },
@@ -615,13 +761,14 @@ export function createInput(options: InputOptions): Input {
 
     requestCapture(): void {
       wantsCapture = true;
-      // Free look keeps the cursor visible (edge-turn needs it); a crosshair reads as "aiming".
-      canvas.style.cursor = 'crosshair';
-      tryLock();
+      // Free look keeps the normal cursor (shots go to the screen centre, not to the cursor), and
+      // edge-turn only re-arms after the next real mouse movement: the cursor may still sit where a
+      // menu button was, near a screen edge.
+      pointerSeen = false;
+      tryLock(false);
     },
     releaseCapture(): void {
       wantsCapture = false;
-      canvas.style.cursor = '';
       releaseHeldMouse();
       lookYaw = 0;
       lookPitch = 0;
@@ -693,8 +840,9 @@ export function createInput(options: InputOptions): Input {
       virtualMoveY = 0;
     },
 
-    bindingLabel(action: InputAction): string {
-      const table = device === 'gamepad' ? PAD_LABELS : device === 'touch' ? TOUCH_LABELS : KEY_LABELS;
+    bindingLabel(action: InputAction, forDevice?: InputDevice): string {
+      const which = forDevice ?? device;
+      const table = which === 'gamepad' ? PAD_LABELS : which === 'touch' ? TOUCH_LABELS : KEY_LABELS;
       return table[action] ?? '';
     },
     rumble(strength: number, seconds: number): void {
@@ -732,13 +880,6 @@ export function createInput(options: InputOptions): Input {
         released[i] = (!held && was) || (latchReleased[i] === 1 && !held) ? 1 : 0;
         down[i] = held ? 1 : 0;
         prev[i] = down[i] as number;
-        // Analog amount: any digital source saturates it; otherwise the trigger value.
-        const digital =
-          (keyHeld[i] as number) > 0 ||
-          virtualHeld[i] === 1 ||
-          virtualTap[i] === 1 ||
-          (virtualTimer[i] as number) > 0;
-        analog[i] = !held ? 0 : digital ? 1 : (padAnalog[i] as number);
         latchPressed[i] = 0;
         latchReleased[i] = 0;
         virtualTap[i] = 0;

@@ -6,6 +6,7 @@ import * as THREE from 'three';
 import type {
   DamageInfo,
   DamageResult,
+  FxSpawnOptions,
   HitPart,
   HitSphere,
   LookDelta,
@@ -17,6 +18,7 @@ import type {
   RunStats,
   ScreenPoint,
   ShotHit,
+  SoundOptions,
 } from './types';
 
 export function makeRayHit(): RayHit {
@@ -45,6 +47,7 @@ export function makeShotHit(): ShotHit {
     normal: new THREE.Vector3(0, 1, 0),
     target: null,
     part: 'body',
+    sphereIndex: -1,
     surface: 'metal',
     boxId: -1,
   };
@@ -61,6 +64,7 @@ export function makePierceResult(capacity = 16): PierceResult {
     endNormal: new THREE.Vector3(0, 1, 0),
     hitWorld: false,
     surface: 'metal',
+    boxId: -1,
   };
 }
 
@@ -72,11 +76,13 @@ export function makeDamageInfo(): DamageInfo {
     sourceId: 0,
     weapon: null,
     part: 'body',
+    sphereIndex: -1,
     critScale: 1,
     point: new THREE.Vector3(),
     dir: new THREE.Vector3(),
     knockback: 0,
     splash: false,
+    creditPlayer: false,
     silent: false,
   };
 }
@@ -89,11 +95,13 @@ export function clearDamageInfo(info: DamageInfo): DamageInfo {
   info.sourceId = 0;
   info.weapon = null;
   info.part = 'body';
+  info.sphereIndex = -1;
   info.critScale = 1;
   info.point.set(0, 0, 0);
   info.dir.set(0, 0, 0);
   info.knockback = 0;
   info.splash = false;
+  info.creditPlayer = false;
   info.silent = false;
   return info;
 }
@@ -130,6 +138,40 @@ export function makeScreenPoint(): ScreenPoint {
 
 export function makeLookDelta(): LookDelta {
   return { yaw: 0, pitch: 0 };
+}
+
+/** FxSpawnOptions that owns its vectors, for callers that spawn effects from update paths. */
+export type FxOptionsScratch = FxSpawnOptions & {
+  normal: THREE.Vector3;
+  dir: THREE.Vector3;
+  velocity: THREE.Vector3;
+};
+
+/** Reusable FxSpawnOptions (module-level scratch). Every field starts at its documented default. */
+export function makeFxOptions(): FxOptionsScratch {
+  return clearFxOptions({
+    normal: new THREE.Vector3(),
+    dir: new THREE.Vector3(),
+    velocity: new THREE.Vector3(),
+  });
+}
+
+/** Restore the defaults (normal and dir up, no velocity, scale 1, authored size and colour, world clock). Returns it. */
+export function clearFxOptions(options: FxOptionsScratch): FxOptionsScratch {
+  options.normal.set(0, 1, 0);
+  options.dir.set(0, 1, 0);
+  options.velocity.set(0, 0, 0);
+  options.scale = 1;
+  options.radius = undefined;
+  options.charge = undefined;
+  options.color = undefined;
+  options.clock = 'world';
+  return options;
+}
+
+/** Reusable SoundOptions (module-level scratch) at the documented defaults; `timeScaled` stays unset (per-call default). */
+export function makeSoundOptions(): SoundOptions {
+  return { volume: 1, pitch: 1, delay: 0, priority: 1, owner: 0 };
 }
 
 export function makeModifiers(): Modifiers {

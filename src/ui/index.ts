@@ -2,7 +2,7 @@
 import { DIFFICULTIES } from '../core/constants';
 import { DIFFICULTY } from '../data/difficulty';
 import { PERKS } from '../data/perks';
-import type { GameContext, UiSystem } from '../core/types';
+import type { GameContext, UiScreen, UiSystem } from '../core/types';
 
 const STYLE = `
 .sh-hud{position:absolute;left:max(16px,env(safe-area-inset-left,0px));bottom:max(16px,env(safe-area-inset-bottom,0px));font:14px/1.5 var(--sh-font-mono);color:var(--sh-text);white-space:pre;text-shadow:0 1px 2px #000}
@@ -13,7 +13,8 @@ const STYLE = `
 .sh-panel h1{font:700 clamp(32px,7vw,64px) var(--sh-font-display);letter-spacing:.14em;margin:0;color:var(--sh-text)}
 .sh-panel p{margin:0;color:var(--sh-text-dim);font:16px var(--sh-font-ui);letter-spacing:.08em}
 .sh-btn{font:600 16px var(--sh-font-ui);letter-spacing:.16em;color:var(--sh-cyan);background:var(--sh-panel);border:1px solid var(--sh-cyan);padding:12px 22px;min-width:240px;cursor:pointer}
-.sh-btn:hover,.sh-btn:focus-visible{background:var(--sh-cyan);color:var(--sh-bg);outline:none}`;
+.sh-btn:hover,.sh-btn:focus-visible{background:var(--sh-cyan);color:var(--sh-bg);outline:none}
+.sh-test *,.sh-test *::before,.sh-test *::after{transition-duration:0s!important;animation-duration:0s!important}`;
 
 /** Gray-box UI: text HUD plus one full-screen panel per state (menu, perk choice, pause, end screens). */
 export function createUiSystem(ctx: GameContext): UiSystem {
@@ -25,6 +26,7 @@ export function createUiSystem(ctx: GameContext): UiSystem {
   let panelKey = '';
   let banner = '';
   let bannerLeft = 0;
+  let fatal = false;
 
   const button = (label: string, onClick: () => void, id: string): HTMLButtonElement => {
     const el = document.createElement('button');
@@ -50,10 +52,21 @@ export function createUiSystem(ctx: GameContext): UiSystem {
 
   const ui: UiSystem = {
     showFatal(): void {
+      fatal = true;
       hud.hidden = top.hidden = cross.hidden = panel.hidden = true;
     },
     wantsPointer: () => ctx.director.phase === 'perkSelect',
     consumesPauseAction: () => false,
+    get screen(): UiScreen {
+      const mode = ctx.game.mode;
+      if (fatal || mode === 'boot') return 'none';
+      if (mode === 'menu') return 'menu';
+      if (mode === 'paused') return 'pause';
+      if (mode === 'gameover' || mode === 'victory') return mode;
+      return ctx.director.perkOffer ? 'perkSelect' : 'hud';
+    },
+    // The gray box only has the automatic screens (no settings / controls / difficulty panels to force).
+    debugShow(): void {},
     init(): void {
       style.textContent = STYLE;
       hud.className = 'sh-hud';
@@ -62,6 +75,8 @@ export function createUiSystem(ctx: GameContext): UiSystem {
       panel.className = 'sh-panel';
       panel.hidden = true;
       document.head.append(style);
+      // Automation: every transition / animation is instant so screenshots are repeatable.
+      if (ctx.testMode) ctx.uiRoot.classList.add('sh-test');
       ctx.uiRoot.append(hud, top, cross, panel);
       ctx.events.on('announce', (e) => {
         banner = e.sub ? `${e.text} — ${e.sub}` : e.text;
@@ -73,6 +88,7 @@ export function createUiSystem(ctx: GameContext): UiSystem {
       bannerLeft = 0;
     },
     update(realDt: number): void {
+      if (fatal) return;
       const { game, director, player, weapons } = ctx;
       const mode = game.mode;
       const playing = mode === 'playing' || mode === 'paused';

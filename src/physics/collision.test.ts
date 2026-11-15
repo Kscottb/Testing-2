@@ -4,12 +4,17 @@
  * world of thousands of boxes.
  */
 import * as THREE from 'three';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { COL } from '../core/constants';
 import { makeMoveResult, makeRayHit } from '../core/make';
 import { createRng } from '../core/rng';
 import type { Aabb, BoxDesc, CollisionWorld, MoveResult, Vec3Like } from '../core/types';
+import { ALLOC_LIMIT_BYTES, WARM_UP_CALLS, boxOneNumberPerCall, bytesPerCall } from './heapmeter';
 import { createCollisionWorld } from './index';
+
+// Brute-force references and long random walks on a machine shared with other jobs: no test here is
+// allowed to fail because it was starved of CPU for a few seconds.
+vi.setConfig({ testTimeout: 120_000 });
 
 const HW = 0.35;
 const H = 1.8;
@@ -84,9 +89,9 @@ function tiledFloor(world: CollisionWorld, half: number, noise = 0): void {
 }
 
 /** A solid flight of stairs climbing toward +x from x0: `count` treads of `tread` x `rise`, then a terrace. */
-function stairs(world: CollisionWorld, x0: number, count: number, tread: number, rise: number, endX: number): void {
+function stairs(world: CollisionWorld, x0: number, count: number, tread: number, rise: number, endX: number, halfDepth = 2): void {
   for (let i = 0; i < count; i++) {
-    world.addBox(box(x0 + tread * i, 0, -2, endX, rise * (i + 1), 2));
+    world.addBox(box(x0 + tread * i, 0, -halfDepth, endX, rise * (i + 1), halfDepth));
   }
 }
 
@@ -207,9 +212,6 @@ function bigWorld(count: number, seed: number): CollisionWorld {
   world.finalize();
   return world;
 }
-
-const heapUsed = (): number =>
-  (globalThis as unknown as { process: { memoryUsage(): { heapUsed: number } } }).process.memoryUsage().heapUsed;
 
 describe('collision world: bookkeeping', () => {
   it('stores boxes with defaults, normalised extents and stable ids', () => {
@@ -789,10 +791,11 @@ describe('moveAndSlide: step-up', () => {
     const world = worldOf(FLOOR, box(2, 0, -5, 6, 0.3, 5));
     for (const left of [0, 1e-9, 1e-6, 1e-5, 4e-5, 1e-4, 3e-4, 1e-3]) {
       const pos = new THREE.Vector3(2 - HW - 0.1 + left, 0, 0);
-      const first = move(world, pos, 0.1, -0.0067, 0, { stepUp: STEP, snapDown: STEP });
+      // move() hands back one shared result object: read the first verdict before moving again.
+      const firstHit = move(world, pos, 0.1, -0.0067, 0, { stepUp: STEP, snapDown: STEP }).hitX;
       const second = move(world, pos, 0.1, -0.0067, 0, { stepUp: STEP, snapDown: STEP });
       // Never reported as a wall hit (that would zero the mover's velocity), up within two frames.
-      expect(first.hitX || second.hitX).toBe(false);
+      expect(firstHit || second.hitX).toBe(false);
       expect(pos.y).toBe(0.3);
       expect(second.grounded).toBe(true);
       expect(pos.x).toBeGreaterThan(2 - HW);
@@ -844,6 +847,99 @@ describe('moveAndSlide: step-up', () => {
     expect(pos.x).toBeCloseTo(1.9, 9);
     expect(pos.y).toBeGreaterThan(0.3);
     expect(r).toMatchObject({ grounded: false, hitX: false });
+  });
+
+  it('climbs and descends stairs diagonally without stalling or losing sideways speed', () => {
+    const world = createCollisionWorld();
+    world.addBox(FLOOR);
+    stairs(world, 2, 10, 0.3, 0.2, 14, 16);
+    world.finalize();
+    for (const hz of [30, 60, 144]) {
+      const dt = 1 / hz;
+      for (const angle of [0.3, Math.PI / 4, 1.1]) {
+        const vx = Math.cos(angle) * 6.5;
+        const vz = Math.sin(angle) * 6.5;
+        // Up.
+        const pos = new THREE.Vector3(0.5, 0, -10);
+        let frames = 0;
+        for (; pos.x < 8 && frames < 3000; frames++) {
+          const beforeZ = pos.z;
+          const r = move(world, pos, vx * dt, -GRAVITY * dt * dt, vz * dt, { stepUp: STEP, snapDown: STEP });
+          if (r.hitX || r.hitZ || !r.grounded || Math.abs(pos.z - beforeZ - vz * dt) > 1e-9) {
+            throw new Error(`up ${hz} Hz angle ${angle} frame ${frames}: ${JSON.stringify(r)} at ${pos.toArray().join(', ')}`);
+          }
+        }
+        expect(pos.y).toBeCloseTo(2, 9);
+        // Every frame advanced the full stride (plus at most the step-up borrow).
+        expect(pos.x - 0.5).toBeGreaterThanOrEqual(frames * vx * dt - 1e-6);
+        expect(pos.x - 0.5).toBeLessThan(frames * vx * dt + 0.02);
+        // And back down.
+        pos.set(8, 2, -10);
+        for (frames = 0; pos.x > 0.5 && frames < 3000; frames++) {
+          const r = move(world, pos, -vx * dt, -GRAVITY * dt * dt, vz * dt, { stepUp: STEP, snapDown: STEP });
+          if (r.hitX || r.hitZ || !r.grounded) {
+            throw new Error(`down ${hz} Hz angle ${angle} frame ${frames}: ${JSON.stringify(r)} at ${pos.toArray().join(', ')}`);
+          }
+        }
+        expect(pos.y).toBe(0);
+        expect(8 - pos.x).toBeCloseTo(frames * vx * dt, 6);
+      }
+    }
+  });
+
+  it('hops a low rim with a drop behind it instead of stopping dead', () => {
+    // A deck with a 0.2 m toe board along its edge and nothing within snap reach beyond it.
+    const world = worldOf(box(-30, -9, -30, 30, -8, 30), box(-5, -1, -5, 1, 0, 5), box(1, -1, -5, 1.05, 0.2, 5));
+    // One stride that carries the whole body past the rim: over it, back at deck height, in the air.
+    const pos = new THREE.Vector3(0.2, 0, 0);
+    let r = move(world, pos, 1.5, -0.0267, 0, { stepUp: STEP, snapDown: STEP });
+    expect(r).toMatchObject({ hitX: false, grounded: false, stepped: 0, snapped: 0 });
+    expect(pos.x).toBeCloseTo(1.7, 9);
+    expect(pos.y).toBeLessThanOrEqual(0);
+    expect(pos.y).toBeGreaterThan(-0.03);
+    expect(penetration(world, pos)).toBe(0);
+    r = move(world, pos, 0, -20, 0);
+    expect(pos.y).toBe(-8);
+    expect(r.grounded).toBe(true);
+    // A small body (0.2 wide) clears it at a run.
+    pos.set(0.7, 0, 0);
+    r = move(world, pos, 0.5, -0.0067, 0, { stepUp: STEP, snapDown: STEP, hw: 0.1, h: 0.5 });
+    expect(r).toMatchObject({ hitX: false, grounded: false });
+    expect(pos.x).toBeCloseTo(1.2, 9);
+    // At walking pace the body steps onto the rim first and walks off it: never a wall hit.
+    pos.set(0.2, 0, 0);
+    let top = 0;
+    let left = -1;
+    for (let i = 0; i < 40; i++) {
+      r = move(world, pos, 6.5 / 60, -0.0067, 0, { stepUp: STEP, snapDown: STEP });
+      expect(r.hitX).toBe(false);
+      top = Math.max(top, pos.y);
+      if (!r.grounded && left < 0) left = pos.x;
+    }
+    expect(top).toBe(0.2);
+    expect(left).toBeGreaterThan(1.05 + HW - 1e-3);
+    // The same rim with a floor within snap reach behind it is an ordinary step down.
+    const terrace = worldOf(box(-5, -1, -5, 1, 0, 5), box(1, -1, -5, 1.05, 0.2, 5), box(1.05, -1, -5, 8, -0.3, 5));
+    pos.set(0.2, 0, 0);
+    r = move(terrace, pos, 1.5, -0.0267, 0, { stepUp: STEP, snapDown: STEP });
+    expect(r).toMatchObject({ hitX: false, grounded: true, stepped: 0 });
+    expect(pos.y).toBe(-0.3);
+    expect(r.snapped).toBeCloseTo(0.3, 9);
+    expect(pos.x).toBeCloseTo(1.7, 9);
+  });
+
+  it('fits a crouched body under a beam that stops a standing one', () => {
+    const world = worldOf(FLOOR, box(2, 1.2, -5, 3, 3, 5));
+    const pos = new THREE.Vector3(0, 0, 0);
+    let r = move(world, pos, 4, 0, 0, { stepUp: STEP, snapDown: STEP });
+    expect(pos.x).toBe(2 - HW);
+    expect(r).toMatchObject({ hitX: true, wallBoxId: 1, grounded: true });
+    r = move(world, pos, 4, 0, 0, { stepUp: STEP, snapDown: STEP, h: 1.1 });
+    expect(pos.x).toBeCloseTo(2 - HW + 4, 12);
+    expect(r).toMatchObject({ hitX: false, grounded: true });
+    // Standing up under the beam is the caller's decision; the query that supports it is overlapBox.
+    expect(world.overlapBox(box(2.5 - HW, 0, -HW, 2.5 + HW, H, HW), COL.PLAYER)).toBe(1);
+    expect(world.overlapBox(box(2.5 - HW, 0, -HW, 2.5 + HW, 1.1, HW), COL.PLAYER)).toBe(-1);
   });
 });
 
@@ -966,6 +1062,25 @@ describe('moveAndSlide: gates', () => {
       expect(world.groundHeight(5.5, 0, 10, COL.PLAYER)).toBe(0);
       world.setEnabled(gate, true);
     }
+  });
+
+  it('drops a body whose floor is switched off and catches it again when switched on', () => {
+    const world = worldOf(FLOOR, box(-2, 0, -2, 2, 3, 2, { tag: 'lift' }));
+    const pos = new THREE.Vector3(0, 3, 0);
+    expect(move(world, pos, 0, -0.0067, 0, { snapDown: STEP })).toMatchObject({ grounded: true, groundBoxId: 1 });
+    world.setEnabledByTag('lift', false);
+    let r = move(world, pos, 0, -0.5, 0, { snapDown: STEP });
+    expect(r.grounded).toBe(false);
+    expect(pos.y).toBe(2.5);
+    // Switched back on around the body: it is expelled, never left inside.
+    world.setEnabledByTag('lift', true);
+    r = move(world, pos, 0, -0.0067, 0);
+    expect(penetration(world, pos)).toBeLessThanOrEqual(SKIN);
+    world.setEnabledByTag('lift', false);
+    pos.set(0, 2.5, 0);
+    r = move(world, pos, 0, -10, 0);
+    expect(pos.y).toBe(0);
+    expect(r).toMatchObject({ grounded: true, groundBoxId: 0 });
   });
 });
 
@@ -1109,6 +1224,34 @@ describe('moveAndSlide: random walk through clutter', () => {
     expect(stepsTaken).toBeGreaterThan(200);
     expect(wallHits).toBeGreaterThan(2000);
     expect(worst).toBeLessThanOrEqual(SKIN + 1e-9);
+  });
+
+  it('handles far more nearby boxes than the candidate buffer starts with', () => {
+    const world = createCollisionWorld();
+    world.addBox(FLOOR);
+    // 400 paper plates stacked into a 2 m pillar, 300 slats forming a wall, 300 tiles on the floor.
+    for (let i = 0; i < 400; i++) world.addBox(box(3, i * 0.005, -1, 4, (i + 1) * 0.005, 1));
+    for (let i = 0; i < 300; i++) world.addBox(box(-4, 0, -3 + i * 0.02, -3, 3, -3 + (i + 1) * 0.02));
+    for (let i = 0; i < 300; i++) world.addBox(box(-3 + (i % 20) * 0.3, 0, -3 + Math.floor(i / 20) * 0.4, -2.7 + (i % 20) * 0.3, 0.004, -2.6 + Math.floor(i / 20) * 0.4));
+    world.finalize();
+    const pos = new THREE.Vector3(0, 0, 0);
+    let r = move(world, pos, 10, -0.0067, 0, { stepUp: STEP, snapDown: STEP });
+    expect(pos.x).toBe(3 - HW);
+    expect(r).toMatchObject({ hitX: true, grounded: true });
+    r = move(world, pos, -20, -0.0067, 0.4, { stepUp: STEP, snapDown: STEP });
+    expect(pos.x).toBe(-3 + HW);
+    expect(pos.z).toBeCloseTo(0.4, 9);
+    expect(r).toMatchObject({ hitX: true, hitZ: false, grounded: true });
+    expect(penetration(world, pos)).toBeLessThanOrEqual(SKIN);
+    // Dropping onto the plate stack lands on its top plate.
+    pos.set(3.5, 4, 0);
+    r = move(world, pos, 0, -10, 0);
+    expect(pos.y).toBeCloseTo(2, 9);
+    expect(r.grounded).toBe(true);
+    const ids: number[] = [];
+    expect(world.overlapBoxAll(box(3.1, -0.5, -2, 4.5, 3, 2), COL.ANY, ids)).toBe(401);
+    expect(ids[0]).toBe(0);
+    expect(ids[400]).toBe(400);
   });
 });
 
@@ -1477,24 +1620,6 @@ describe('performance', () => {
     }
     return hits;
   };
-  const others = (n: number): number => {
-    let hits = 0;
-    for (let i = 0; i < n; i++) {
-      origin.set(Math.cos(i * 0.37) * 60, 1.2, Math.sin(i * 0.11) * 35);
-      target.set(Math.cos(i * 0.21) * 60, 1.5, Math.sin(i * 0.47) * 35);
-      if (world.lineOfSight(origin, target, COL.SIGHT)) hits++;
-      query.minX = origin.x;
-      query.minY = 0.5;
-      query.minZ = origin.z;
-      query.maxX = origin.x + 2;
-      query.maxY = 2;
-      query.maxZ = origin.z + 2;
-      if (world.overlapBox(query, COL.ANY) >= 0) hits++;
-      if (world.overlapSphere(origin, 1.5, COL.ANY)) hits++;
-    }
-    return hits;
-  };
-
   it('moves and raycasts in a 5000-box world in microseconds', () => {
     moves(20000);
     rays(20000);
@@ -1522,45 +1647,152 @@ describe('performance', () => {
     expect(fresh.bounds).toEqual(world.bounds);
   });
 
-  it('does not allocate per query once warmed up', () => {
-    // moveAndSlide, raycast, lineOfSight, overlapBox and overlapSphere hand everything back through
-    // out params, ints or booleans. (groundHeight returns a fractional number, which the engine may
-    // box at the call boundary, and overlapBoxAll grows the caller's array; both are left out.)
-    const round = (n: number): void => {
-      moves(n);
-      rays(n);
-      others(n);
-    };
-    round(60000);
-    const diag = (name: string, fn: (n: number) => unknown): void => {
-      const g: number[] = [];
-      for (let k = 0; k < 21; k++) {
-        const b = heapUsed();
-        fn(5000);
-        g.push(heapUsed() - b);
+  describe('heap allocation', () => {
+    // A second world: the queries must stay allocation free when the engine cannot specialise the
+    // code for one instance (with a single world it constant-folds everything the closures capture,
+    // which hides boxing that shows up as soon as a test, a tool or a restart creates another one).
+    const decoy = worldOf(FLOOR, box(2, 0, -5, 6, 0.3, 5));
+    const ids: number[] = [];
+    // Simulation state lives in typed arrays: a captured `let` holding a double would itself be
+    // boxed on every assignment and drown the measurement.
+    const sim = new Float64Array(2); // [vy, grounded]
+    const seen = new Int32Array(5); // steps, walls, ceilings, airborne frames, snaps
+    const walker = new THREE.Vector3(0, 0, 0);
+
+    /** A player-like run through the clutter: walking, steps, walls, jumps, head bumps, landings. */
+    const walk = (n: number): void => {
+      const dt = 1 / 60;
+      for (let i = 0; i < n; i++) {
+        const grounded = sim[1] === 1;
+        let vy = sim[0];
+        if (grounded && i % 53 === 0) vy = 7.75;
+        vy -= GRAVITY * dt;
+        const heading = Math.floor(i / 40) * 2.399963 + Math.sin(i * 0.013) * 0.4;
+        const speed = i % 400 < 30 ? 24 : 6.5;
+        delta.set(Math.cos(heading) * speed * dt, vy * dt, Math.sin(heading) * speed * dt);
+        const jumping = vy > 0;
+        world.moveAndSlide(walker, HW, H, delta, COL.PLAYER, grounded ? STEP : 0.2, grounded && !jumping ? STEP : 0, result);
+        if (result.stepped > 0) seen[0]++;
+        if (result.hitX || result.hitZ) seen[1]++;
+        if (result.hitCeiling) seen[2]++;
+        if (!result.grounded) seen[3]++;
+        if (result.snapped > 0) seen[4]++;
+        if (result.grounded || (result.hitCeiling && jumping)) vy = 0;
+        sim[0] = vy;
+        sim[1] = result.grounded ? 1 : 0;
+        if (Math.abs(walker.x) > 72 || Math.abs(walker.z) > 42 || walker.y < -1) {
+          walker.set(0, 0, 0);
+          sim[0] = 0;
+          sim[1] = 1;
+        }
       }
-      g.sort((a, b) => a - b);
-      console.info('DIAG', name, g[10]);
     };
-    diag('moves', moves);
-    diag('rays', rays);
-    diag('others', others);
-    diag('los', (n) => { for (let i = 0; i < n; i++) { origin.set(Math.cos(i * 0.37) * 60, 1.2, Math.sin(i * 0.11) * 35); target.set(Math.cos(i * 0.21) * 60, 1.5, Math.sin(i * 0.47) * 35); world.lineOfSight(origin, target, COL.SIGHT); } });
-    diag('obox', (n) => { for (let i = 0; i < n; i++) { query.minX = Math.cos(i * 0.37) * 60; query.maxX = query.minX + 2; world.overlapBox(query, COL.ANY); } });
-    diag('sphere', (n) => { for (let i = 0; i < n; i++) { origin.set(Math.cos(i * 0.37) * 60, 1.2, Math.sin(i * 0.11) * 35); world.overlapSphere(origin, 1.5, COL.ANY); } });
-    diag('setonly', (n) => { for (let i = 0; i < n; i++) { origin.set(Math.cos(i * 0.37) * 60, 1.2, Math.sin(i * 0.11) * 35); } });
-    // Heap growth per round of 15 000 queries. Optimising compiles, deopts and GCs can disturb single
-    // rounds, so the verdict is the median: code that allocated even one boxed number per query
-    // would add more than 200 kB to nearly every round.
-    const growth: number[] = [];
-    for (let k = 0; k < 41; k++) {
-      const before = heapUsed();
-      round(5000);
-      growth.push(heapUsed() - before);
-    }
-    growth.sort((a, b) => a - b);
-    const median = growth[growth.length >> 1] as number;
-    console.info(`[physics] median heap growth per 15 000 queries: ${median} bytes`);
-    expect(median).toBeLessThan(32_000);
+    const sightLines = (n: number): number => {
+      let clear = 0;
+      for (let i = 0; i < n; i++) {
+        origin.set(Math.cos(i * 0.37) * 60, 1.2, Math.sin(i * 0.11) * 35);
+        target.set(Math.cos(i * 0.21) * 60, 1.5, Math.sin(i * 0.47) * 35);
+        if (world.lineOfSight(origin, target, COL.SIGHT)) clear++;
+        if (world.lineOfSight(target, origin)) clear++;
+      }
+      return clear;
+    };
+    const boxOverlaps = (n: number): number => {
+      let hits = 0;
+      for (let i = 0; i < n; i++) {
+        query.minX = Math.cos(i * 0.37) * 60;
+        query.minY = 0.5;
+        query.minZ = Math.sin(i * 0.11) * 35;
+        query.maxX = query.minX + 2;
+        query.maxY = 2;
+        query.maxZ = query.minZ + 2;
+        if (world.overlapBox(query, COL.ANY) >= 0) hits++;
+      }
+      return hits;
+    };
+    const sphereOverlaps = (n: number): number => {
+      let hits = 0;
+      for (let i = 0; i < n; i++) {
+        origin.set(Math.cos(i * 0.37) * 60, 1.2, Math.sin(i * 0.11) * 35);
+        if (world.overlapSphere(origin, 1.5, COL.ANY)) hits++;
+      }
+      return hits;
+    };
+    /** The same four regions over and over: the result array keeps its size. */
+    const boxOverlapLists = (n: number): number => {
+      let total = 0;
+      for (let i = 0; i < n; i++) {
+        const k = i & 3;
+        query.minX = -20 + k * 9;
+        query.minY = 0.2;
+        query.minZ = -12 + k * 5;
+        query.maxX = query.minX + 6;
+        query.maxY = 2.5;
+        query.maxZ = query.minZ + 6;
+        total += world.overlapBoxAll(query, COL.ANY, ids);
+      }
+      return total;
+    };
+    /**
+     * Integer coordinates: a fractional number passed to a call that is not inlined is boxed by the
+     * CALLER, which is not what this test is about.
+     */
+    const grounds = (n: number): number => {
+      let raised = 0;
+      for (let i = 0; i < n; i++) {
+        if (world.groundHeight(((i * 7) % 140) - 70, ((i * 13) % 80) - 40, 10, COL.PLAYER) > 0) raised++;
+      }
+      return raised;
+    };
+
+    it('measures a single boxed number per call (positive control)', () => {
+      expect(boxOneNumberPerCall(WARM_UP_CALLS)).toBeTypeOf('number');
+      const control = bytesPerCall(boxOneNumberPerCall);
+      console.info(`[physics] control: ${control.toFixed(2)} bytes per boxed number`);
+      // 16 bytes on 64-bit V8, 12 with pointer compression. If this ever reads ~0 the measurement
+      // has gone blind and the checks below prove nothing.
+      expect(control).toBeGreaterThan(8);
+      expect(control).toBeLessThan(40);
+    });
+
+    it('does not allocate in moveAndSlide, raycast, lineOfSight or the overlap queries', () => {
+      expect(decoy.boxes).toHaveLength(2);
+      const queries: [string, (n: number) => unknown][] = [
+        ['moveAndSlide (steady walk)', moves],
+        ['moveAndSlide (run, jump, step, bump)', walk],
+        ['raycast', rays],
+        ['lineOfSight', sightLines],
+        ['overlapBox', boxOverlaps],
+        ['overlapSphere', sphereOverlaps],
+        ['overlapBoxAll (stable result size)', boxOverlapLists],
+      ];
+      for (const [, fn] of queries) fn(WARM_UP_CALLS);
+      // Every code path of the walk was really taken while measuring.
+      seen.fill(0);
+      const report: string[] = [];
+      for (const [name, fn] of queries) {
+        const bytes = bytesPerCall(fn);
+        report.push(`${name} ${bytes.toFixed(2)}`);
+        if (bytes >= ALLOC_LIMIT_BYTES) throw new Error(`${name} allocates about ${bytes.toFixed(1)} bytes per call`);
+      }
+      console.info(`[physics] heap bytes per call: ${report.join(', ')}`);
+      expect(seen[0]).toBeGreaterThan(100);
+      expect(seen[1]).toBeGreaterThan(100);
+      expect(seen[2]).toBeGreaterThan(10);
+      expect(seen[3]).toBeGreaterThan(1000);
+      expect(seen[4]).toBeGreaterThan(100);
+      expect(rays(2000)).toBeGreaterThan(1000);
+      expect(boxOverlapLists(4)).toBeGreaterThan(4);
+    });
+
+    it('groundHeight costs at most the boxing of its return value', () => {
+      // The contract returns the height as a number: the engine boxes a fractional result (12-16
+      // bytes) whenever it does not inline the call. Nothing else may be allocated.
+      grounds(WARM_UP_CALLS);
+      const bytes = bytesPerCall(grounds);
+      console.info(`[physics] groundHeight: ${bytes.toFixed(2)} heap bytes per call`);
+      expect(bytes).toBeLessThan(20);
+      expect(grounds(5600)).toBeGreaterThan(50);
+    });
   });
 });

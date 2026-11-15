@@ -179,7 +179,15 @@ describe('rng / pool / math / settings', () => {
     expect(settings.data.fov).toBe(100);
     settings.set('fov', 100);
     expect(changed).toEqual(['fov']);
+    // Storage is written on a trailing timer (a slider drag must not hit it 60 times a second) ...
+    expect(createSettings(storage, bus).data.fov).toBe(78);
+    // ... or at once when flushed (page hidden / closed).
+    settings.flush();
     expect(createSettings(storage, bus).data.fov).toBe(100);
+    expect(settings.data.quality).toBe('auto');
+    settings.set('quality', 'ultra');
+    settings.set('quality', 'nonsense' as never);
+    expect(settings.data.quality).toBe('ultra');
     const mods = makeModifiers();
     mods.damageMul = 9;
     expect(resetModifiers(mods).damageMul).toBe(1);

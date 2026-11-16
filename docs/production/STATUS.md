@@ -63,6 +63,33 @@ cannot finish cleanly in one session is split into smaller parts first.
    `node tools/campaign.mjs --mode dist --god 1`), fix or record any failure, mark the push done here, commit,
    push, and stop. Never start a third system in the same push.
 
+### Schedule
+
+A scheduled task ("Static Horizon weekly push") fires every Wednesday at 1:10 PM Pacific time, ten minutes after
+the weekly usage reset, and runs exactly one push. Measured cost of a push of two systems: roughly 40 % of one
+five-hour session and about 6 % of the weekly allowance.
+
+### Notes for the later pushes
+
+- **Integration (push 6)**: read every `build/<system>.report.json` first. The contract requests, judgement
+  calls and integration notes in them are the work list (for example: `DamageNumberOptions` has no armour flag;
+  combat's glow gains and the fx looks were tuned against a stand-in for the real post chain and must be
+  re-judged under the real renderer; nothing has been verified by ear). The gate that matters is the bot
+  finishing the campaign on Recruit **without** god mode, plus the sandboxed-embed smoke test.
+- **Review rounds (pushes 7 to 9)**: each round is find -> verify -> fix on the running game, one lens per
+  reviewer (gameplay and balance, bugs, visuals from screenshots, UI at phone / tablet / desktop sizes and with
+  touch, input fallbacks without pointer lock, performance against the budgets in the brief, audio by
+  measurement). Fixes are grouped by the directory that owns the code.
+- **Single-file build**: the playable build is one HTML page with the bundled script and styles inlined
+  (`npm run build` emits `dist/index.html` + `dist/assets/game.js` with stable names for this purpose). Rules
+  for the hosted page: no external requests except Google Fonts stylesheets; no reliance on a query string;
+  pointer lock and fullscreen are optional (requested from a click, with the free-look fallback when refused);
+  audio starts only after a user gesture; storage access wrapped in try/catch; no alert / confirm / prompt, no
+  downloads, no new windows; `html` and `body` at `height: 100%`; a dark colour scheme with an explicit body
+  background; the page title is "Static Horizon". Escape any `</script` inside the inlined bundle. Verify the
+  packaged page with the sandboxed-embed smoke mode before publishing.
+- **README** (push 9): how to run (`npm install`, `npm run dev`), how to build, controls, and the checks.
+
 ## Not done yet
 
 1. Build the real systems against the frozen contract, one owner per directory, following `BRIEF.md` and

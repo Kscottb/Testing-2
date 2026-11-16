@@ -42,7 +42,7 @@ Everything needed to resume is in this folder.
 | render | stub |
 | player | stub |
 | weapons | stub |
-| combat | stub |
+| combat | built (141 unit tests; smoke and god-mode campaign pass) |
 | director | stub |
 | enemies (manager + skitter, tick, riveter) | stub |
 | enemies (wasp, lancer, bulwark) | stub |

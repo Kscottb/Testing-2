@@ -29,7 +29,7 @@ Each system's report (contract requests, judgement calls, integration notes, ope
 
 ## How the work is paced
 
-One push per weekly usage reset. A push builds **two** systems side by side and nothing else; every system is
+One push per week. A push builds **two** systems side by side and nothing else; every system is
 finished, checked, committed and pushed inside the same session. Nothing is ever left half-built: a part that
 cannot finish cleanly in one session is split into smaller parts first.
 
@@ -65,8 +65,8 @@ cannot finish cleanly in one session is split into smaller parts first.
 
 ### Schedule
 
-A scheduled task ("Static Horizon weekly push") fires every Wednesday at 1:10 PM Pacific time, ten minutes after
-the weekly usage reset, and runs exactly one push. Measured cost of a push of two systems: roughly 40 % of one
+A scheduled task ("Static Horizon weekly push") fires every Saturday at 9:36 PM Pacific time and runs exactly
+one push. The weekend night slot keeps it clear of other weekday work that shares the same usage allowance. Measured cost of a push of two systems: roughly 40 % of one
 five-hour session and about 6 % of the weekly allowance.
 
 ### Notes for the later pushes

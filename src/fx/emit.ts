@@ -26,7 +26,7 @@ export const SHAPE = {
 
 /** Colour sentinels: the effect's accent (overridable by opts.color) and shades of it. */
 export const ACCENT = -1;
-export const ACCENT_DIM = -2;
+/** A hotter, paler shade of the accent. */
 export const ACCENT_PALE = -3;
 /** The effect's second accent (never overridden). */
 export const ACCENT2 = -4;
@@ -346,13 +346,6 @@ export class Emitter {
     this.z += this.nz * metres;
   }
 
-  /** Move the origin along the main direction (metres). */
-  advance(metres: number): void {
-    this.x += this.dx * metres;
-    this.y += this.dy * metres;
-    this.z += this.dz * metres;
-  }
-
   /** Reverse the main direction (sparks that spray back toward a shooter). */
   reverse(): void {
     this.dx = -this.dx;
@@ -458,11 +451,7 @@ export class Emitter {
       return;
     }
     const src = spec === ACCENT2 ? this.accent2Rgb : this.accentRgb;
-    if (spec === ACCENT_DIM) {
-      out[0] = src[0] * 0.3;
-      out[1] = src[1] * 0.3;
-      out[2] = src[2] * 0.3;
-    } else if (spec === ACCENT_PALE) {
+    if (spec === ACCENT_PALE) {
       // A hotter shade of the same hue (a plain mix with white would turn orange-red into pink).
       out[0] = Math.pow(src[0], 0.45);
       out[1] = Math.pow(src[1], 0.45);

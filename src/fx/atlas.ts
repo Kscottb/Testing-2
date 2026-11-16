@@ -13,8 +13,7 @@ export const DIGIT_CELL_W = 96;
 export const DIGIT_CELL_H = 128;
 export const DIGIT_ATLAS_W = 1024;
 export const DIGIT_ATLAS_H = 128;
-/** Distance-field value at the stroke edge and at the outer edge of the outline. */
-export const DIGIT_FILL_EDGE = 0.5;
+/** Distance-field value at the outer edge of the outline (the stroke edge itself is at 0.5). */
 export const DIGIT_OUTLINE_EDGE = 0.2;
 
 function clamp01(v: number): number {
@@ -164,7 +163,7 @@ function sprite(cell: number, u: number, v: number, zap: number[]): Rgb {
     case SPR.FIRE: {
       const edge = r + (fbm(u * 2.4 + 3, v * 2.4 + 8, 71) - 0.5) * 0.7;
       const body = 1 - smooth(0.4, 0.97, edge);
-      const d = clamp01(body * (0.5 + 1.0 * ridged(u * 3.2, v * 3.2, 77))) * smooth(0.97, 0.82, r);
+      const d = clamp01(body * (0.62 + 0.75 * ridged(u * 2.6, v * 2.6, 77))) * smooth(0.97, 0.82, r);
       R = d;
       G = clamp01(0.4 + d * 0.8);
       B = clamp01((d - 0.5) * 2);

@@ -382,7 +382,7 @@ export function createFxSystem(ctx: GameContext): FxSystem {
     r.shared.uTime.value = time;
     // Matte things (smoke, dust, debris, decal chips) take the colour of the scene light.
     const lighting = ctx.render.lighting;
-    const boost = 1 + 2.5 * lighting.flash;
+    const boost = 1 + 2.5 * (lighting.flash > 0 ? Math.min(lighting.flash, 1) : 0);
     const ambient = lighting.ambientIntensity * 0.55;
     const sun = lighting.sunIntensity * 0.2;
     r.shared.uLight.value.set(
@@ -408,7 +408,7 @@ export function createFxSystem(ctx: GameContext): FxSystem {
     r.lights.clear();
     r.ribbon.reset();
     // Nothing of the cleared effects may be drawn again, even if no update follows before the next draw.
-    for (const batch of r.batches) batch.hide();
+    for (let i = 0; i < r.batches.length; i++) (r.batches[i] as InstancedBatch).hide();
     r.decals.dirty = false;
     time = 0;
     r.shared.uTime.value = 0;

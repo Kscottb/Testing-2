@@ -91,7 +91,6 @@ const SPARK_UP = vary(sparkDef, { shape: SHAPE.CONE, cone: 0.55 });
 const accentSpark: LayerDef = { ...sparkDef, colorA: ACCENT_PALE, colorB: ACCENT };
 const ASPARK_HEMI = layer(accentSpark);
 const ASPARK_SPHERE = vary(accentSpark, { shape: SHAPE.SPHERE });
-const ASPARK_CONE = vary(accentSpark, { shape: SHAPE.CONE, alongDir: true, cone: 0.42 });
 const ASPARK_DISC = vary(accentSpark, { shape: SHAPE.DISC, up: 2 });
 
 const streakDef: LayerDef = {
@@ -104,7 +103,6 @@ const STREAK_CONE = vary(streakDef, { shape: SHAPE.CONE, alongDir: true, cone: 0
 const STREAK_WIDE = vary(streakDef, { shape: SHAPE.CONE, alongDir: true, cone: 0.9 });
 const STREAK_DISC = vary(streakDef, { shape: SHAPE.DISC });
 const STREAK_DISC_D = vary(streakDef, { shape: SHAPE.DISC, alongDir: true });
-const STREAK_HEMI = vary(streakDef, { shape: SHAPE.HEMI });
 /** Rising column of streaks (unlocks, respawn): spawned around the origin, going up the normal. */
 const STREAK_RISE = vary(streakDef, { shape: SHAPE.CONE, cone: 0.07, jitter: 0.5, drag: 1.2, life: 0.5, stretch: 0.07 });
 /** Streaks that fly inward to the origin. */
@@ -114,7 +112,6 @@ const emberDef: LayerDef = {
   sprite: SPR.DOT, ramp: RAMP.EMBER, secondary: true, abs: true, size: 0.045, sizeVar: 0.4, speed: 2.2, speedVar: 0.6,
   gravity: 2.5, drag: 1.4, life: 1.1, lifeVar: 0.4, shape: SHAPE.HEMI, colorA: C.spark, colorB: C.sparkDim, gain: 4,
 };
-const EMBER = layer(emberDef);
 const EMBER_SPHERE = vary(emberDef, { shape: SHAPE.SPHERE });
 /** Floating accent motes. */
 const MOTE = vary(emberDef, { colorA: ACCENT_PALE, colorB: ACCENT, gravity: -0.8, shape: SHAPE.SPHERE, speed: 1.4, gain: 3.5 });
@@ -141,7 +138,6 @@ const hexDef: LayerDef = {
   life: 0.45, lifeVar: 0.3, colorA: ACCENT_PALE, colorB: ACCENT, gain: 3, shape: SHAPE.HEMI,
 };
 /** Shield cells. */
-const HEX = layer(hexDef);
 const HEX_SPHERE = vary(hexDef, { shape: SHAPE.SPHERE });
 const HEX_FLAT = vary(hexDef, { flat: true, shape: SHAPE.NONE, spin: 0, jitter: 0.25, ramp: RAMP.FLICKER, life: 0.22 });
 const HEX_IN = vary(hexDef, { shape: SHAPE.SPHERE, ramp: RAMP.GATHER, offset: 1, speed: -3, speedVar: 0.2, drag: 0, life: 0.32, lifeVar: 0.1 });

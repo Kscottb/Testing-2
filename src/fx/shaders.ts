@@ -659,7 +659,8 @@ void main() {
         size = minSize;
       }
       bright *= 0.5 + 0.5 * sin(uWeatherTime * shape.w * (0.6 + aRand.z) + aRand.y * 60.0);
-      bright *= smoothstep(0.15, 0.7, depth);
+      // Motes right in front of the lens would be big blurry discs: they fade out instead.
+      bright *= smoothstep(0.6, 2.4, depth);
       mvPosition.xy += c * size;
       cell = shape.y;
     } else if (layer == 1) {

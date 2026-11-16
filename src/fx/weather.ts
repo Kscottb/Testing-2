@@ -90,7 +90,7 @@ function look(values: Partial<Record<keyof typeof F, number>>, moteTint = 0xffff
 const LOOKS: Record<WeatherId, Float32Array> = {
   clear: look({}),
   embers: look(
-    { MOTE_DENSITY: 0.85, MOTE_SIZE: 0.042, MOTE_GAIN: 4, MOTE_TWINKLE: 2.4, MOTE_SUN: 0.45, WIND_X: 0.9, WIND_Y: 0.35, WIND_Z: 0.4 },
+    { MOTE_DENSITY: 0.6, MOTE_SIZE: 0.042, MOTE_GAIN: 3.6, MOTE_TWINKLE: 2.4, MOTE_SUN: 0.45, WIND_X: 0.9, WIND_Y: 0.35, WIND_Z: 0.4 },
     0xffa868,
   ),
   haze: look(
@@ -306,7 +306,7 @@ export class Weather {
     this.uWeatherTime.value = this.time;
     this.applyDensity();
     const lighting: LightingState = ctx.render.lighting;
-    const flash = lighting.flash;
+    const flash = lighting.flash > 0 ? Math.min(lighting.flash, 1) : 0;
     const sun = lighting.sunColor;
     const fog = lighting.fogColor;
 

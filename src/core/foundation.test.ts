@@ -3,7 +3,7 @@
  * passing when the baseline physics / nav implementations are replaced by hardened ones.
  */
 import * as THREE from 'three';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { createNavGrid } from '../nav';
 import { createCollisionWorld } from '../physics';
 import { COL } from './constants';
@@ -191,6 +191,25 @@ describe('rng / pool / math / settings', () => {
     const mods = makeModifiers();
     mods.damageMul = 9;
     expect(resetModifiers(mods).damageMul).toBe(1);
+  });
+
+  it('reduceFlashes follows the OS in normal play only: never in test mode, and a stored choice wins', () => {
+    vi.stubGlobal('matchMedia', (query: string) => ({ matches: query === '(prefers-reduced-motion: reduce)' }));
+    try {
+      const bus = createEventBus();
+      expect(createSettings(createStorage('flash-a:'), bus).data.reduceFlashes).toBe(true);
+      // The harness asks for reduced motion on every launch: automated runs must still see the full flashes.
+      expect(createSettings(createStorage('flash-b:'), bus, true).data.reduceFlashes).toBe(false);
+      const storage = createStorage('flash-c:');
+      const settings = createSettings(storage, bus);
+      settings.set('reduceFlashes', false);
+      settings.flush();
+      expect(createSettings(storage, bus).data.reduceFlashes).toBe(false);
+      // The default the settings screen resets to is fixed, whatever the OS says.
+      expect(settings.defaults.reduceFlashes).toBe(false);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
 

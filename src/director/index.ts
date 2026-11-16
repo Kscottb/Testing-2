@@ -24,7 +24,7 @@ export function createDirectorSystem(ctx: GameContext): DirectorSystem {
   const root = new THREE.Group();
   root.name = 'director';
   const spawnAt = new THREE.Vector3();
-  let difficulty: Difficulty = 'veteran', phase: DirectorPhase = 'idle', wave = 0, score = 0, timer = 0, timerTotal = 0, waveTime = 0, pending: { type: EnemyType; at: number }[] = [], offer: PerkId[] | null = null, offeredAt = 0, endTimer = -1, endVictory = false, mercyTimer = 0;
+  let difficulty: Difficulty = 'veteran', phase: DirectorPhase = 'idle', wave = 0, score = 0, timer = 0, timerTotal = 0, waveTime = 0, pending: { type: EnemyType; at: number }[] = [], offer: PerkId[] | null = null, offeredAt = 0, endTimer = -1, endVictory = false, mercyTimer = 0, bossSeen = false;
 
   const setPhase = (next: DirectorPhase, seconds = 0): void => {
     const prev = phase;
@@ -35,7 +35,7 @@ export function createDirectorSystem(ctx: GameContext): DirectorSystem {
   const startWave = (): void => {
     wave++;
     const def = waveDef(wave);
-    stats.wave = wave; waveTime = 0; pending = [];
+    stats.wave = wave; waveTime = 0; pending = []; bossSeen = false;
     for (const g of def.groups) {
       const count = def.boss ? g.count : Math.ceil(g.count * ctx.mods.enemyCountMul);
       for (let i = 0; i < count; i++) pending.push({ type: g.type, at: g.at + i * g.interval });
@@ -97,6 +97,11 @@ export function createDirectorSystem(ctx: GameContext): DirectorSystem {
     mercyTimer = MERCY_INTERVAL;
     if (!ctx.nav.randomPointInAnnulus(ctx.player.position, 6, 12, ctx.rng, spawnAt)) spawnAt.copy(ctx.player.position);
     director.spawnPickup('ammo', spawnAt);
+  };
+  /** The boss is beaten: the run is decided, victory follows after the staged death. */
+  const bossDefeated = (sequenceSeconds: number): void => {
+    setPhase('done');
+    endTimer = Math.max(0, sequenceSeconds); endVictory = true;
   };
   const finish = (): void => {
     stats.seconds = ctx.time.runTime; stats.shots = ctx.weapons.shotsFired; stats.hits = ctx.weapons.shotsHit;
@@ -161,7 +166,7 @@ export function createDirectorSystem(ctx: GameContext): DirectorSystem {
       ctx.enemies.killAll(true);
       ctx.combat.clearProjectiles();
       wave = Math.min(TOTAL_WAVES, Math.max(1, Math.floor(target))) - 1;
-      pending = []; offer = null;
+      pending = []; offer = null; bossSeen = false;
       ctx.time.clearScale('perkSelect');
       for (let w = 1; w <= wave; w++) {
         const def = waveDef(w);
@@ -193,21 +198,23 @@ export function createDirectorSystem(ctx: GameContext): DirectorSystem {
       });
       ctx.events.on('hit:confirmed', (e) => { stats.damageDealt += e.amount; });
       ctx.events.on('player:damaged', (e) => { stats.damageTaken += e.amount; });
+      // END OF RUN: whichever of the two events arrives first decides the run (phase 'done'); the other
+      // is ignored from then on.
       ctx.events.on('player:died', () => {
-        // The run is over: the phase machine stops for good and a pending perk offer is withdrawn,
-        // or the world would stay frozen behind a dead camera.
-        if (endTimer >= 0 && endVictory) return;
+        if (phase === 'done') return;
+        // The phase machine stops for good and a pending perk offer is withdrawn, or the world would
+        // stay frozen behind a dead camera.
         if (offer) { offer = null; ctx.time.clearScale('perkSelect'); }
         endTimer = DEATH_DELAY_SECONDS; endVictory = false;
-        if (phase !== 'done') setPhase('done');
+        setPhase('done');
       });
-      ctx.events.on('boss:defeated', (e) => { if (phase === 'boss') { setPhase('done'); endTimer = e.sequenceSeconds; endVictory = true; } });
+      ctx.events.on('boss:defeated', (e) => { if (phase === 'boss') bossDefeated(e.sequenceSeconds); });
     },
     reset(): void {
       for (const p of [...pickups]) removePickup(p);
       resetRunStats(stats); perks.clear();
       Object.assign(combo, { multiplier: 1, count: 0, timeLeft: 0 });
-      phase = 'idle'; wave = 0; score = 0; timer = 0; timerTotal = 0; pending = []; offer = null; offeredAt = 0; endTimer = -1; endVictory = false; mercyTimer = 0; objective.text = '';
+      phase = 'idle'; wave = 0; score = 0; timer = 0; timerTotal = 0; pending = []; offer = null; offeredAt = 0; endTimer = -1; endVictory = false; mercyTimer = 0; bossSeen = false; objective.text = '';
     },
     update(dt: number): void {
       if (phase === 'perkSelect') {
@@ -255,7 +262,11 @@ export function createDirectorSystem(ctx: GameContext): DirectorSystem {
           // A refused spawn (enemy cap) stays pending and is retried next frame.
           if (!ctx.enemies.spawn(next.type, spawnAt)) break;
           pending.shift();
+          if (def.boss) bossSeen = true;
         }
+        // Boss watchdog: the boss is gone without 'boss:defeated' (removed silently after an error):
+        // that counts as defeated, or the run would sit in 'boss' for ever.
+        if (phase === 'boss' && bossSeen && ctx.enemies.boss === null) { bossDefeated(0); return; }
         if (pending.length === 0 && ctx.enemies.waveCount === 0 && phase === 'combat') {
           director.addScore(def.clearBonus, 'waveClear');
           ctx.combat.clearProjectiles('enemy');

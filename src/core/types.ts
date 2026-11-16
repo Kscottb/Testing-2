@@ -109,8 +109,9 @@
  *   - render, audio, ui          : ctx.time.realDt      (never stops, also while paused / in menus)
  *   Things inside world-clock systems that belong to the player run on ctx.time.playerDt instead
  *   (= unscaledDt while playing, dt in every other mode): player-faction projectiles (combat), effects
- *   spawned with clock 'player' (fx), corpse timers (enemies), the death delay and the boss-defeat wait
- *   (director). Timers that must run during the perk-select hard freeze compare ctx.time.elapsed stamps.
+ *   spawned with clock 'player' (fx), corpse timers and the boss-death cleanup (enemies), the death
+ *   delay and the boss-defeat wait (director). Timers that must run during the perk-select hard freeze
+ *   compare ctx.time.elapsed stamps.
  *   update(dt) may receive dt === 0 (hard freeze, manual frame(0)): never divide by dt.
  *
  * FEEDBACK OWNERSHIP RULE (who triggers FX + audio — exactly one owner per moment, nothing double-fires)
@@ -151,9 +152,11 @@
  *     when the effect ends. PLAYER and WEAPONS implement onModeChange: when the new mode is neither
  *     'playing' nor 'paused' they restore every level they own, stop their loops and clear their time
  *     scale (their update no longer runs, so nothing else would).
- *   - Everything positional that belongs to an entity (sounds, loops, beams, telegraphs, trails) is
- *     started with `owner: <entity id>`; the enemy manager / combat call ctx.audio.stopOwner(id) and
- *     ctx.fx.cancelOwner(id) when that entity dies or is removed, so a forgotten handle never hums on.
+ *   - Everything positional that belongs to an entity AND MUST END WITH IT (idle / telegraph / attack /
+ *     hurt sounds, loops, beams, telegraphs, trails) is started with `owner: <entity id>`; the enemy
+ *     manager / combat call ctx.audio.stopOwner(id) and ctx.fx.cancelOwner(id) when that entity dies or
+ *     is removed, so a forgotten handle never hums on. One-shot sounds that must ring out AFTER the
+ *     entity is gone (death sounds, impact sounds) are started WITHOUT owner.
  *   - Gameplay systems never stop or restart loops for pause or the perk freeze: audio suspends them.
  *   - Persistent ambient loops (world, director) are acquired lazily inside update():
  *     `if (!handle.active && ctx.audio.unlocked) handle = ctx.audio.loop(id, opts)` — never in init() or
@@ -163,7 +166,8 @@
  *   - Core wraps every System call (see System). On top of that the enemy manager wraps EVERY EnemyBehavior
  *     call and combat wraps its per-projectile step in try/catch: report with
  *     ctx.game.reportError('enemy:<type>' | 'projectile:<kind>', error), remove that one entity silently,
- *     never rethrow — one broken entity must not take the frame or the run down.
+ *     never rethrow — one broken entity must not take the frame or the run down. (A boss removed this
+ *     way ends the fight: see the boss watchdog under DirectorSystem ANTI-STALL.)
  *   - AudioSystem and FxSystem never throw from any public non-lifecycle method: they catch at the
  *     boundary, call ctx.game.reportError('audio' | 'fx', error) once and fall back to no-ops (shared dead
  *     handles). A sound or particle bug costs sound or sparks, never the run.
@@ -271,6 +275,8 @@ export type GameMode = 'boot' | 'menu' | 'playing' | 'paused' | 'gameover' | 'vi
  * Run flow owned by the director:
  * idle -> warmup -> combat -> cleared -> [supplyDrop] -> perkSelect -> intermission -> combat ...
  * wave 10: intermission -> bossIntro -> boss -> done -> ctx.game.endRun(true).
+ * `done` = the run is decided and only the end-of-run wait is left: the boss was defeated, or the player
+ * died (from ANY phase) — see END OF RUN at DirectorSystem.
  */
 export type DirectorPhase =
   | 'idle'
@@ -745,9 +751,15 @@ export type EnemyManagerSoundId =
   | 'conductorSpawn';
 
 /**
- * OWNER: enemy KINDS — each id by the kind named in it (played positionally with owner: actor.id).
- * Pattern per kind: Idle motif, Telegraph, Attack (the launch / muzzle sound: combat adds none), Hurt
- * (in onDamaged), Death (in onKilled).
+ * OWNER: enemy KINDS — each id by the kind named in it, played positionally (playAt). Pattern per kind:
+ * Idle motif, Telegraph, Attack (the launch / muzzle sound: combat adds none), Hurt (in onDamaged), Death
+ * (in onKilled).
+ * `owner`: Idle, Telegraph, Attack and Hurt one-shots pass `owner: actor.id` — they end with the actor.
+ * Sounds that must OUTLIVE the actor pass NO owner: every `<type>Death`, conductorDeathStart /
+ * conductorDeathBurst / conductorDeathFinal, and any other one-shot (also a delayed one) started in
+ * onKilled, in updateDying or right before a self-kill (a tick calling ctx.enemies.kill on itself). The
+ * manager calls audio.stopOwner(actor.id) before onKilled and again at despawn, which for a death
+ * without corpse time is the same call stack: an owner-bound death sound would be cut after 60 ms.
  */
 export type EnemyKindSoundId =
   | 'skitterIdle'
@@ -1022,7 +1034,10 @@ export interface GameContext {
    * Automation mode, strictly opt-in: the page was opened with `?test=1`, or the embedding frame is named
    * 'sh-test'. Effects: the simulation only advances through window.__SH.step (manual stepping), fixed
    * seeds, no pointer lock, no auto-pause on blur, the dynamic-resolution governor and ambient lightning
-   * are off, UI transitions are instant. Never true in normal play.
+   * are off, UI transitions are instant, and a setting that would follow the OS starts from its fixed
+   * default instead (reduceFlashes false: tools see the full-flash path). Quality 'auto' is still
+   * resolved from the device — tools that need one preset call window.__SH.setQuality. Never true in
+   * normal play.
    */
   readonly testMode: boolean;
   /** Unique positive integer ids for entities, hit targets, pickups, projectiles. */
@@ -1210,8 +1225,9 @@ export interface EventMap {
    *              and explosive crits apply ONLY when byPlayer.
    *   score    = EnemyDef.score when byPlayer and not silent, else 0 (the director applies combo,
    *              difficulty and the 25 % rule for summoned enemies).
-   *   world-credited kills (weapon === 'world': hazards, killAll, bounds cull, EnemySystem.kill) and silent
-   *              kills (info.silent) are never rewarded at all: no stats.kills, no pickup drop.
+   *   world-credited kills (weapon === 'world': hazards, bounds cull, EnemySystem.kill / killAll, the
+   *              boss-death cleanup — byPlayer is always false for them) and silent kills (info.silent)
+   *              are never rewarded at all: no stats.kills, no pickup drop.
    *   every other kill (also enemy-on-enemy without player credit) counts in stats.kills and rolls a drop.
    */
   'enemy:killed': {
@@ -1248,7 +1264,10 @@ export interface EventMap {
   'player:shieldRecharged': Record<string, never>;
   /** E: player. Health crossed the low-health threshold (30 %) in either direction. */
   'player:lowHealth': { active: boolean };
-  /** E: player. hp reached 0 (last stand already consumed). The director ends the run ~1.5 s later. */
+  /**
+   * E: player. hp reached 0 (last stand already consumed). The director ends the run
+   * DEATH_DELAY_SECONDS later — unless 'boss:defeated' came first (END OF RUN at DirectorSystem).
+   */
   'player:died': { info: Readonly<DamageInfo> };
   /** E: player. Movement notifications (viewmodel bob, UI). `impactSpeed` is the downward speed in m/s. */
   'player:jumped': { double: boolean };
@@ -1326,10 +1345,11 @@ export interface EventMap {
   /** E: enemies (inside EnemySystem.setBossPhase, called by the boss kind). */
   'boss:phase': { boss: BossHandle; phase: number; prev: number };
   /**
-   * E: enemies (manager), at the START of the staged death (same call as the boss 'enemy:killed'); never
-   * for silent kills. `sequenceSeconds` is what the boss kind returned from onKilled: the director waits
-   * exactly that long on ctx.time.playerDt, then calls game.endRun(true); it only reacts while its phase
-   * is 'boss'.
+   * E: enemies (manager), at the START of the staged death (same call as the boss 'enemy:killed', and
+   * BEFORE the first cleanup kill of the other enemies); never for silent kills. `sequenceSeconds` is
+   * what the boss kind returned from onKilled: the director waits exactly that long on
+   * ctx.time.playerDt, then calls game.endRun(true); it only reacts while its phase is 'boss' (END OF
+   * RUN at DirectorSystem). The player absorbs every hit from this event until the next reset().
    */
   'boss:defeated': { boss: BossHandle; position: THREE.Vector3; sequenceSeconds: number };
 
@@ -1510,7 +1530,7 @@ export interface SettingsData {
   /**
    * Applied by RENDER (caps the post flash and lightning boosts) and FX (halves lightFlash intensity, no
    * bolt strobing). Nobody else checks it: writers always pass the full value. Defaults to the OS
-   * "reduce motion" preference when nothing was stored.
+   * "reduce motion" preference when nothing was stored (to false in ctx.testMode).
    */
   reduceFlashes: boolean;
   /** UI shows the frame counter. */
@@ -1900,19 +1920,31 @@ export interface HazardInfo {
 }
 
 /**
- * One key of the menu camera path. Render interpolates position and target with a centripetal
- * Catmull-Rom spline over the closed loop of keys (linear time within a segment) and restarts at key 0
- * every time the menu is entered. WORLD guarantees that a tube of 1 m radius along that curve is free of
- * geometry.
+ * One key of the menu camera path (WorldSystem.cinematicPath). The list is cyclic — after the last key
+ * comes key 0 — and render restarts at key 0 every time the menu is entered.
+ * SHOTS. A key with `cut: true` is the LAST key of its shot: on reaching it the camera jumps at once to
+ * the next key, which starts the next shot. The curve never runs across a cut. Without any cut the whole
+ * path is one closed loop.
+ * THE CURVE — world and render compute the identical one, with three.js as the reference: position and
+ * target each follow `new THREE.CatmullRomCurve3(points, closed, 'centripetal')`; closed over all keys
+ * when no key cuts, otherwise one OPEN curve per shot through the keys of that shot in order (a shot may
+ * wrap from the last key to key 0). Travelling from key i of a curve to the next takes key i's
+ * `seconds` with linear time: point = curve.getPoint((i + u) / segments), u = 0 .. 1, where `segments`
+ * is the number of keys of a closed curve, or keys - 1 of an open one. fov is interpolated linearly
+ * along a segment.
+ * `seconds` of a cut key is ignored — except for a shot of ONE key (a cut key right after another cut),
+ * which is a static hold of that many seconds.
+ * WORLD guarantees that a tube of 1 m radius along the position curve is free of geometry and checks it
+ * in its own vitest by sampling exactly that curve.
  */
 export interface CinematicShot {
   readonly position: THREE.Vector3;
   readonly target: THREE.Vector3;
-  /** Seconds to travel to the next key. */
+  /** Seconds to travel to the next key of the same shot (see above for cut keys). */
   readonly seconds: number;
   /** Vertical FOV in degrees at this key (default 55). */
   readonly fov?: number;
-  /** true: hard cut to the next key instead of travelling to it. */
+  /** true: this key ends its shot — hard cut to the next key instead of travelling to it. */
   readonly cut?: boolean;
 }
 
@@ -1959,7 +1991,8 @@ export interface MinimapData {
  * spawn points; everything visible below y = 16 m inside the perimeter is collidable (at least
  * COL.ENEMY | COL.PROJECTILE — flyers and grenades travel there; this overrides "visual only" pipe racks
  * in the world assignment); pure set dressing lives above 16 m or outside the walls. The world's own
- * vitest validates every jump-pad arc (clears geometry, lands on its walkable `target`).
+ * vitest validates every jump-pad arc (clears geometry, lands on its walkable `target`), the menu camera
+ * tube (CinematicShot) and the victory orbit ring (bossArena).
  */
 export interface WorldSystem extends System {
   /** Playable volume. The enemy manager kills enemies that leave it; combat removes projectiles that do. */
@@ -2001,13 +2034,17 @@ export interface WorldSystem extends System {
    * Boss arena on the Core Spire. The boss anchors at center + (0, hoverHeight, 0); EnemyDef.hoverMin /
    * hoverMax of the conductor are only its bob range around that anchor. A boss spawned elsewhere
    * (debug) anchors to its spawn point.
+   * World keeps the VICTORY ORBIT of the camera clear (render does not pull it in): no geometry within
+   * 1.5 m of the horizontal circle of radius `radius * 1.25` around `center`, at height
+   * center.y + hoverHeight * 0.8 — also where that ring leaves the arena (zone wall band, pylons,
+   * perimeter structures).
    */
   readonly bossArena: {
     readonly center: THREE.Vector3;
     readonly radius: number;
     readonly hoverHeight: number;
   };
-  /** Menu camera path (at least 2 keys), see CinematicShot. */
+  /** Menu camera path (at least 2 keys; cyclic), see CinematicShot for shots, cuts and the exact curve. */
   readonly cinematicPath: readonly CinematicShot[];
   readonly minimap: MinimapData;
   /** Height below which the player is considered fallen off the rig (and enemies are culled). */
@@ -2032,7 +2069,10 @@ export interface PostFxParams {
   damageFlash: number;
   /** IMPULSE 0..1 — cyan edge flash (the shield absorbed a hit). Writer: player. */
   shieldFlash: number;
-  /** IMPULSE 0..1 — full-screen colour flash. Written ONLY through RenderSystem.screenFlash (strongest wins). */
+  /**
+   * IMPULSE 0..1 — full-screen colour flash. Written ONLY through RenderSystem.screenFlash (strongest
+   * wins) and by render itself for the capped post flash of lightningFlash.
+   */
   flash: number;
   /** 0xRRGGBB used by `flash`. Written ONLY through RenderSystem.screenFlash. */
   flashColor: number;
@@ -2145,7 +2185,8 @@ export interface ScreenPoint {
  *              ctx.player.position (pulled in by collision.raycast with COL.SIGHT), then orbit at
  *              0.1 rad/s looking at player.position + (0, 1, 0);
  *   victory  — orbit ctx.world.bossArena.center at radius bossArena.radius * 1.25 and height
- *              bossArena.hoverHeight * 0.8, 0.12 rad/s, looking at the arena centre.
+ *              center.y + bossArena.hoverHeight * 0.8, 0.12 rad/s, looking at the arena centre. No
+ *              collision pull-in: the world keeps that ring clear (WorldSystem.bossArena).
  * While playing / paused the player owns the camera: render never touches it.
  * The eclipse sky vortex is render's and sits above ctx.world.bossArena.center (fx weather 'vortex' only
  * adds near-camera streaks).
@@ -2184,9 +2225,11 @@ export interface RenderSystem extends System {
   /** Mutable reactive post inputs (see PostFxParams). */
   readonly post: PostFxParams;
   /**
-   * Full-screen colour flash (explosions near the player: combat; lightning and white-outs: enemy
-   * manager / conductor kind; storm: fx weather). Strongest wins: applied only when `intensity` (0..1)
-   * exceeds the current post.flash, and then it also sets the colour. Capped by render under reduceFlashes.
+   * Full-screen colour flash. Callers: combat (explosions near the player) and the conductor kind
+   * (staged white-outs) — nobody else. LIGHTNING NEVER USES IT: render.lightningFlash adds its own
+   * capped post flash, and the enemy manager (arrivals), fx weather (storm) and the conductor kind
+   * (strikes) call lightningFlash only. Strongest wins: applied only when `intensity` (0..1) exceeds the
+   * current post.flash, and then it also sets the colour. Capped by render under reduceFlashes.
    */
   screenFlash(color: number, intensity: number): void;
 
@@ -2346,8 +2389,9 @@ export interface OverclockState {
  * onModeChange(mode) — the player MUST implement it: when mode is neither 'playing' nor 'paused', end
  *   Overclock (ctx.time.clearScale('overclock')), write post.lowHealth = post.overclock = post.dashBlur =
  *   0, ctx.audio.setMuffle(0) and stop its loops (see "LEVELS" in the header).
- * Events it listens to: 'enemy:killed' with byPlayer (Overclock charge, the lifeOnKill perk) and
- *   'hit:confirmed' on the boss (1 Overclock point per 150 damage — the boss gives none on death).
+ * Events it listens to: 'enemy:killed' with byPlayer (Overclock charge, the lifeOnKill perk),
+ *   'hit:confirmed' on the boss (1 Overclock point per 150 damage — the boss gives none on death) and
+ *   'boss:defeated' (from then until the next reset() every hit is absorbed: see takeDamage).
  * Overclock points per kill = EnemyDef.overclockCharge * (crit ? 1.5 : 1) * (1 + 0.1 *
  *   (ctx.director.combo.multiplier - 1)), with the multiplier as it stands BEFORE this kill (the player's
  *   handler runs before the director's); no gain while overclock.active.
@@ -2391,16 +2435,22 @@ export interface PlayerSystem extends System {
   readonly shield: number;
   readonly maxShield: number;
   readonly alive: boolean;
-  /** Dash i-frames, last-stand grace, spawn protection or ctx.debug.god. */
+  /**
+   * Dash i-frames, last-stand grace, spawn protection, ctx.debug.god — or the boss was defeated
+   * ('boss:defeated' until the next reset()).
+   */
   readonly invulnerable: boolean;
   /** HitTarget id registered with combat. Enemy attacks address the player through combat with it. */
   readonly targetId: number;
 
   /**
    * Apply damage (reached through combat.applyDamage(player.targetId, info)). Absorbed without any
-   * effect while ctx.game.mode !== 'playing', while invulnerable or dead. Otherwise: enemy-faction
-   * damage is multiplied by ctx.mods.damageTakenMul; shield first, then health; last stand; knockback =
-   * addImpulse(info.dir * info.knockback / PLAYER.MASS). The player owns ALL feedback of being hit:
+   * effect while ctx.game.mode !== 'playing', while invulnerable or dead — which includes everything
+   * from 'boss:defeated' until the next reset(), whatever the source: the fight is won, and neither a
+   * cleanup blast nor a hazard or a fall during the staged death may kill the victor. Otherwise:
+   * enemy-faction damage is multiplied by ctx.mods.damageTakenMul; shield first, then health; last
+   * stand; knockback = addImpulse(info.dir * info.knockback / PLAYER.MASS). The player owns ALL feedback
+   * of being hit:
    * fx 'hitPlayer' / 'hitPlayerShield' at info.point, hurt sounds, post.damageFlash / shieldFlash, shake,
    * rumble, and 'player:damaged' / 'player:shieldBroken' / 'player:died'.
    */
@@ -2737,7 +2787,8 @@ export interface ProjectileOptions {
  * Projectiles: per-kind look, trail, fly loop and defaults come from data/projectiles.ts. Combat owns
  * their meshes, trails (owner = projectile id), loops, world impacts (shared impact ids), 'grenadeBounce',
  * 'bulletWhiz' and 'mortarWhistle'; it plays NO launch sound. When a projectile is removed for any reason
- * combat calls ctx.fx.cancelOwner(id) and ctx.audio.stopOwner(id). At MAX_PROJECTILES (96) live
+ * combat calls ctx.fx.cancelOwner(id) and ctx.audio.stopOwner(id) — so only the fly loop and the whistle
+ * carry `owner: <projectile id>`; impact, bounce and blast sounds carry none. At MAX_PROJECTILES (96) live
  * projectiles the oldest one is removed silently to make room. Kinds marked `shootable` in
  * data/projectiles.ts are registered as HitTargets (faction of the projectile, one sphere, enemy = null):
  * any damage from a hostile faction destroys them with a small harmless burst.
@@ -2888,13 +2939,18 @@ export interface BossHandle extends EnemyHandle {
  *     Survived -> onDamaged + 'enemy:damaged'.
  *  5. Death (hp 0, EnemySystem.kill, killAll): alive = false, HitTarget unregistered, token freed,
  *     ctx.fx.cancelOwner(id) + ctx.audio.stopOwner(id); corpseSeconds = info.silent ? 0 :
- *     (onKilled(info) ?? 0); 'enemy:killed' is emitted. A non-silent BOSS death additionally: every other
- *     live enemy is killed as a world kill, staggered over 0.6 s; ctx.combat.clearProjectiles('enemy');
- *     then 'boss:defeated' with sequenceSeconds = corpseSeconds. With corpseSeconds > 0 the actor stays
- *     in the scene with dying = true and updateDying() is called every substep until that time has run
- *     out on ctx.time.playerDt (so slow motion staged by the kind does not stretch it).
- *  6. Despawn (corpse time over, or immediately; also reset() and killAll(true)): cancelOwner +
- *     stopOwner again, behavior.onDespawn(), root hidden, slot back to the pool.
+ *     (onKilled(info) ?? 0); 'enemy:killed' is emitted. An actor killed while still ARRIVING (spawning)
+ *     gets no onKilled either — nothing of it was visible yet: corpseSeconds = 0, the event is emitted
+ *     as usual. A non-silent BOSS death additionally, in this order: ctx.combat.clearProjectiles(
+ *     'enemy'); 'boss:defeated' with sequenceSeconds = corpseSeconds (still inside the same call); then
+ *     every other live enemy is killed as a world kill, staggered over the next 0.6 s of
+ *     ctx.time.playerDt (the player already absorbs everything by then, see PlayerSystem.takeDamage).
+ *     With corpseSeconds > 0 the actor stays in the scene with dying = true (set before the events go
+ *     out) and updateDying() is called every substep until that time has run out on ctx.time.playerDt
+ *     (so slow motion staged by the kind does not stretch it).
+ *  6. Despawn (corpse time over, or immediately after step 5; also reset() and killAll(true)):
+ *     cancelOwner + stopOwner again, behavior.onDespawn(), root hidden, slot back to the pool. This is
+ *     why death sounds carry no owner (see EnemyKindSoundId).
  *
  * WHO WRITES WHAT on the actor
  *   kind    : position (through moveGround / moveFlying, or directly for ballistic moves such as a leap),
@@ -2904,6 +2960,8 @@ export interface BossHandle extends EnemyHandle {
  *
  * The manager wraps EVERY behaviour call in try/catch: an exception is reported with
  * ctx.game.reportError('enemy:<type>', error) and that actor is removed silently; it never rethrows.
+ * A boss removed silently emits no 'boss:defeated': the director's boss watchdog ends the fight
+ * (DirectorSystem ANTI-STALL).
  */
 export interface EnemyKind {
   readonly type: EnemyType;
@@ -2982,9 +3040,19 @@ export interface EnemyBehavior {
   /** After hp changed and the actor survived (hurt flash, hurt sound, stagger). */
   onDamaged?(info: Readonly<DamageInfo>, result: Readonly<DamageResult>): void;
   /**
-   * hp reached 0 (not called for silent kills): play the death (fx, sound, combat.explode ...). Return the
-   * seconds the corpse stays in the scene for a staged death (updateDying runs meanwhile), or nothing / 0
-   * to be removed at once. For the boss this value becomes 'boss:defeated'.sequenceSeconds.
+   * hp reached 0 (not called for silent kills, nor for an actor that was still arriving): play the death
+   * (fx, sound, combat.explode ...). Return the seconds the corpse stays in the scene for a staged death
+   * (updateDying runs meanwhile), or nothing / 0 to be removed at once. For the boss this value becomes
+   * 'boss:defeated'.sequenceSeconds.
+   * WORLD KILLS. info.weapon === 'world' means the actor was REMOVED — by the manager, the director or
+   * the world (boss-death cleanup, bounds cull, straggler watchdog, hazard, debug killAll) or by its own
+   * ctx.enemies.kill(): play the death fx and sound, but deal NO damage from here. A kind that kills
+   * itself in order to attack (the tick's proximity blast) calls ctx.combat.explode BEFORE
+   * ctx.enemies.kill(actor.id).
+   * NO OWNER. Every one-shot sound started here or in updateDying (the death sound, delayed bursts)
+   * passes no `owner`: owner-bound sounds are cut by the despawn that follows, which for a death without
+   * corpse time is this very call stack. Loops, beams and telegraphs of a staged death keep
+   * `owner: actor.id` and end with the corpse.
    */
   onKilled(info: Readonly<DamageInfo>): number | void;
   /**
@@ -3002,8 +3070,6 @@ export interface EnemyBehavior {
 export interface EnemyKillOptions {
   /** No death feedback, no onKilled, no corpse, score 0, a boss dies without staging. Default false. */
   silent?: boolean;
-  /** Credit the kill to the player (byPlayer true, scores). Default false = a world kill, never rewarded. */
-  creditPlayer?: boolean;
 }
 
 /**
@@ -3044,15 +3110,18 @@ export interface EnemySystem extends System {
   queryRadius(center: Vec3Like, radius: number, out: EnemyHandle[]): number;
   /**
    * Kill one live enemy through the normal death path (step 5 above) as if a lethal hit landed:
-   * DamageInfo { type 'hazard', faction 'neutral', sourceId 0, weapon 'world', creditPlayer, silent }.
-   * This is how a kind removes its own actor (a tick detonating by proximity, an expiring summon) and how
-   * the director removes stragglers. Returns false for an unknown, dying or dead id.
+   * DamageInfo { type 'hazard', faction 'neutral', sourceId 0, weapon 'world', creditPlayer false,
+   * silent }. ALWAYS a world kill: never rewarded, and the kind's onKilled deals no damage (see
+   * EnemyBehavior.onKilled). This is how a kind removes its own actor (an expiring summon; a tick
+   * detonating by proximity, which calls ctx.combat.explode first) and how the director removes
+   * stragglers. Returns false for an unknown, dying or dead id.
    */
   kill(enemyId: number, opts?: EnemyKillOptions): boolean;
   /**
    * kill() every live enemy as a world kill (never rewarded); returns how many. With `silent` (debug,
    * cleanups) additionally every corpse is freed at once, nothing plays, and a boss dies WITHOUT its
-   * staging and without 'boss:defeated'.
+   * staging and without 'boss:defeated' (during the director's phase 'boss' its boss watchdog then ends
+   * the fight).
    */
   killAll(silent?: boolean): number;
   /** The boss while it is in the scene (alive or in its staged death), else null. */
@@ -3190,23 +3259,28 @@ export interface ObjectiveState {
  * one 'ammo' pickup on a walkable point 6-12 m from the player, at most once per 12 s. Straggler
  * watchdog: in 'combat' with nothing left to spawn, when no wave enemy was damaged or killed for 40 s,
  * ctx.enemies.kill() those whose ctx.nav.flowDistance is Infinity or that are more than 80 m from the
- * player (this replaces "re-deploy stragglers" of the director assignment; nothing is relocated).
+ * player (this replaces "re-deploy stragglers" of the director assignment; nothing is relocated). Boss
+ * watchdog: in phase 'boss', once the boss was spawned, ctx.enemies.boss === null without a
+ * 'boss:defeated' (the boss was removed silently after an error) counts as defeated with
+ * sequenceSeconds 0: phase 'done', finalise stats, game.endRun(true).
  *
  * PERK SELECT. Offer up to PERK_CHOICES perks that are below maxStacks (fewer when fewer exist; with
  * none the phase is skipped) and hard-freeze the world with ctx.time.setScale('perkSelect', 0). The
- * choice arrives through choosePerk (UI click, bot, debug — never time-guarded) or through the perk1..3
- * actions, which the director polls itself in update(0) and IGNORES until ctx.time.elapsed -
- * perkOfferedAt >= PERK_INPUT_GUARD_SECONDS (0.6 s; the same keys reload and switch weapons). Applying a
- * perk = PerkDef.apply(ctx.mods) plus the instant part: maxHealth -> player.heal(Infinity), maxShield ->
- * player.addShield(25), grenadier -> weapons.addGrenades(1); then sound 'perkAcquire', fx 'perkChosen',
- * 'perk:chosen'.
+ * choice arrives through choosePerk (UI, bot, debug — the method itself is never time-guarded; the UI
+ * locks its own cards, see UiSystem) or through the perk1..3 actions, which the director polls itself
+ * in update(0) and IGNORES until ctx.time.elapsed - perkOfferedAt >= PERK_INPUT_GUARD_SECONDS (0.6 s;
+ * the same keys reload and switch weapons). Applying a perk = PerkDef.apply(ctx.mods) plus the instant
+ * part: maxHealth -> player.heal(Infinity), maxShield -> player.addShield(25), grenadier ->
+ * weapons.addGrenades(1); then sound 'perkAcquire', fx 'perkChosen', 'perk:chosen'.
  *
- * END OF RUN. On 'player:died': the phase machine stops for good (no wave clear, supply, perk offer,
- * intermission or spawn), a pending perk offer is withdrawn (ctx.time.clearScale('perkSelect'),
- * perkOffer = null), slow motion through ctx.time.setScale('slowmo', ...) and post.saturation are the
- * director's death look; after DEATH_DELAY_SECONDS on ctx.time.playerDt it finalises stats and calls
- * game.endRun(false). On 'boss:defeated' (phase 'boss' only): phase 'done', wait sequenceSeconds on
- * ctx.time.playerDt, finalise stats, game.endRun(true).
+ * END OF RUN. Whichever of 'player:died' and 'boss:defeated' arrives FIRST decides the run; the other
+ * is ignored from then on. Both set the phase to 'done', which stops the phase machine for good (no
+ * wave clear, supply, perk offer, intermission or spawn). On 'player:died' (any phase but 'done'): a
+ * pending perk offer is withdrawn (ctx.time.clearScale('perkSelect'), perkOffer = null), slow motion
+ * through ctx.time.setScale('slowmo', ...) and post.saturation are the director's death look; after
+ * DEATH_DELAY_SECONDS on ctx.time.playerDt it finalises stats and calls game.endRun(false). On
+ * 'boss:defeated' (phase 'boss' only): wait sequenceSeconds on ctx.time.playerDt, finalise stats,
+ * game.endRun(true).
  *
  * CLOCKS. Combo window, multikill window, pickup lifetime and all wave / phase timers run on scaled dt;
  * the two end-of-run waits on ctx.time.playerDt; everything timed inside the perk freeze compares
@@ -3232,7 +3306,7 @@ export interface DirectorSystem extends System {
   readonly stats: Readonly<RunStats>;
   /** Perks currently on offer (phase 'perkSelect'), else null. */
   readonly perkOffer: readonly PerkId[] | null;
-  /** ctx.time.elapsed at the moment the current offer appeared (0 when nothing is on offer): the UI draws its input-lock bar from it. */
+  /** ctx.time.elapsed at the moment the current offer appeared (0 when nothing is on offer): the UI locks its cards and draws its input-lock bar from it. */
   readonly perkOfferedAt: number;
   /** Pick offer[index]; false when nothing is on offer or the index is invalid. Unfreezes the world. Never time-guarded. */
   choosePerk(index: number): boolean;
@@ -3593,7 +3667,11 @@ export interface SoundOptions {
    * during Overclock — and true for playAt() (the world slows down).
    */
   timeScaled?: boolean;
-  /** Entity id (enemy.id, projectile id) the sound belongs to: AudioSystem.stopOwner(id) cuts it, pending delay included. Default 0 (none). */
+  /**
+   * Entity id (enemy.id, projectile id) the sound belongs to: AudioSystem.stopOwner(id) cuts it, pending
+   * delay included. Default 0 (none) — which is what a sound that must ring out after its entity is gone
+   * (death, impact) passes.
+   */
   owner?: number;
 }
 
@@ -3733,11 +3811,21 @@ export interface AudioSystem extends System {
  * screen opens, restore the previous one when it closes. uiUp / uiDown / uiLeft / uiRight move DOM focus;
  * the UI implements key repeat itself (0.4 s, then every 0.12 s). Activation and value changes:
  * keyboard and mouse use the NATIVE behaviour of the focused element only (Enter / Space click a button,
- * arrows move a slider); the UI reacts to justPressed('uiConfirm') (-> document.activeElement.click()) and
- * to uiLeft / uiRight value steps ONLY while ctx.input.device === 'gamepad' — otherwise Enter would
- * activate twice. Every button action lives in its DOM click handler. A screen ignores confirm for 0.3 s
- * after it opens. Perk cards: focus moves with uiLeft / uiRight, confirm picks (the D-pad never picks
- * directly); the perk1..3 keys are polled by the director, not the UI.
+ * ArrowLeft / ArrowRight move a slider); the UI reacts to justPressed('uiConfirm')
+ * (-> document.activeElement.click()) and to uiLeft / uiRight value steps ONLY while ctx.input.device ===
+ * 'gamepad' — otherwise Enter would activate twice. Every button action lives in its DOM click handler.
+ * VALUE CONTROLS (a focused <input type="range">, <select>, radio button or role="slider" element):
+ * uiLeft / uiRight never move focus there on any device — they belong to the value — and core/input.ts
+ * cancels the native action of ArrowUp / ArrowDown on every control except text fields, so the vertical
+ * arrows only move focus (an open native <select> list cannot be walked with them: build choices as
+ * sliders or rows of buttons instead).
+ * ACTIVATION GUARD: a screen ignores EVERY activation for 0.3 s (ctx.time.elapsed) after it opens. The
+ * guard sits in the click handlers, so it covers mouse clicks, the native Enter / Space click (Space is
+ * also the jump key) and the gamepad confirm alike. The perk cards use PERK_INPUT_GUARD_SECONDS measured
+ * from ctx.director.perkOfferedAt instead — the same lock as the perk keys and the lock bar. Both hold
+ * in ctx.testMode too: a tool steps past them before it clicks a button.
+ * Perk cards: focus moves with uiLeft / uiRight, confirm picks (the D-pad never picks directly); the
+ * perk1..3 keys are polled by the director, not the UI.
  *
  * TIMING. Everything with a lifetime (banners, hitmarkers, damage arcs, feed entries, callouts,
  * count-ups) is timed by update(realDt), never by animationend / setTimeout. In ctx.testMode the UI adds

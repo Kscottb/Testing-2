@@ -68,16 +68,19 @@ function prefersReducedMotion(): boolean {
 /**
  * Persistent settings: loads once, validates every field, emits on every change and persists on a
  * trailing timer (flushed when the page is hidden or closed).
+ * `testMode` (GameContext.testMode): nothing follows the operating system — every setting that was not
+ * stored starts from DEFAULT_SETTINGS, so automated runs see the same (full-flash) game on every machine.
  */
-export function createSettings(storage: GameStorage, events: EventBus): Settings {
+export function createSettings(storage: GameStorage, events: EventBus, testMode = false): Settings {
   const data: SettingsData = { ...DEFAULT_SETTINGS };
   const stored = storage.getJson<Partial<Record<keyof SettingsData, unknown>>>(STORAGE_KEYS.SETTINGS, {});
   const has = (key: keyof SettingsData): boolean => stored !== null && typeof stored === 'object' && key in stored;
   for (const key of Object.keys(DEFAULT_SETTINGS) as (keyof SettingsData)[]) {
     if (has(key)) assign(data, key, sanitize(key, stored[key], DEFAULT_SETTINGS[key]));
   }
-  // Nothing stored yet: follow the operating system's reduced-motion preference.
-  if (!has('reduceFlashes')) data.reduceFlashes = prefersReducedMotion();
+  // Nothing stored yet: follow the operating system's reduced-motion preference (never in test mode:
+  // the harness asks for reduced motion to calm the CSS, which must not also mute every flash).
+  if (!has('reduceFlashes')) data.reduceFlashes = !testMode && prefersReducedMotion();
 
   let timer: ReturnType<typeof setTimeout> | null = null;
   let dirty = false;

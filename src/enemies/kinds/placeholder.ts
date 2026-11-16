@@ -3,9 +3,10 @@ import * as THREE from 'three';
 import { clearDamageInfo, makeDamageInfo, makeHitSphere } from '../../core/make';
 import { dirToYaw } from '../../core/math';
 import { PALETTE } from '../../core/palette';
-import type { EnemyActor, EnemyBehavior, EnemyKind, EnemyType, FxId, GameContext } from '../../core/types';
+import type { EnemyActor, EnemyBehavior, EnemyKind, EnemyType, FxId, GameContext, SoundId } from '../../core/types';
 
 const DEATH_FX: Record<EnemyType, FxId> = { skitter: 'deathSkitter', riveter: 'deathRiveter', wasp: 'deathWasp', tick: 'deathTick', lancer: 'deathLancer', bulwark: 'deathBulwark', conductor: 'deathConductor' };
+const DEATH_SOUND: Record<EnemyType, SoundId> = { skitter: 'skitterDeath', riveter: 'riveterDeath', wasp: 'waspDeath', tick: 'tickDeath', lancer: 'lancerDeath', bulwark: 'bulwarkDeath', conductor: 'conductorDeathStart' };
 
 /** A capsule that walks (or flies) at the player through the manager's integrators and hurts on contact. */
 export function placeholderKind(type: EnemyType): EnemyKind {
@@ -69,6 +70,10 @@ export function placeholderKind(type: EnemyType): EnemyKind {
         },
         onKilled(): number {
           ctx.fx.spawn(DEATH_FX[type], actor.aimPoint);
+          // NO owner on a death sound: the manager stops everything owned by the actor at despawn, which
+          // for a death without corpse time is right after this call. (A world kill — info.weapon ===
+          // 'world' — would get the same fx and sound here, but never deal damage.)
+          ctx.audio.playAt(DEATH_SOUND[type], actor.aimPoint);
           // The boss stays as a corpse for its staged death; this value becomes 'boss:defeated'.sequenceSeconds.
           return actor.isBoss ? (def.tuning.deathSeconds ?? 0) : 0;
         },

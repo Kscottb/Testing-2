@@ -45,7 +45,7 @@ export function createContext(options: ContextOptions): CoreContext {
 
   const events = createEventBus(options.onEventError);
   const storage = createStorage();
-  const settings = createSettings(storage, events);
+  const settings = createSettings(storage, events, testMode);
   const input = createInput({ canvas, events, settings, testMode });
   const debug: DebugFlags = {
     god: false,

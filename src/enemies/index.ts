@@ -85,19 +85,24 @@ export function createEnemySystem(ctx: GameContext): EnemySystem {
     tokens.delete(actor.id);
     ctx.fx.cancelOwner(actor.id);
     ctx.audio.stopOwner(actor.id);
+    // No onKilled for silent kills, nor for an actor that was still arriving (nothing of it was visible yet).
     let corpse = 0;
     if (!silent && !arriving) {
       try { corpse = actor.behavior.onKilled(info) || 0; } catch (error) { report(actor, error); }
     }
+    if (!(corpse > 0) || !Number.isFinite(corpse)) corpse = 0;
+    actor.dying = corpse > 0; actor.corpse = corpse;
     const byPlayer = info.faction === 'player' || info.creditPlayer;
     ctx.events.emit('enemy:killed', { enemy: actor, type: actor.type, position: actor.aimPoint, info, weapon: info.weapon, crit, byPlayer, score: byPlayer && !silent ? actor.def.score : 0 });
     if (actor.isBoss && !silent) {
-      // The fight is over: remove the adds (world kills; the real manager staggers them over 0.6 s) and their shots.
-      for (const other of [...live]) if (other !== actor && other.alive) system.kill(other.id);
+      // The fight is over. The order is the contract's: enemy shots go, 'boss:defeated' goes out (from
+      // here on the player absorbs everything), and only then the adds are removed as world kills
+      // (the real manager staggers them over 0.6 s).
       ctx.combat.clearProjectiles('enemy');
       ctx.events.emit('boss:defeated', { boss: actor as BossHandle, position: actor.aimPoint, sequenceSeconds: corpse });
+      for (const other of [...live]) if (other !== actor && other.alive) system.kill(other.id);
     }
-    if (corpse > 0 && Number.isFinite(corpse) && inScene(actor)) { actor.dying = true; actor.corpse = corpse; } else despawn(actor);
+    if (!actor.dying) despawn(actor);
   };
   const takeDamage = (actor: Actor, info: DamageInfo): DamageResult => {
     clearDamageResult(result, info.part);
@@ -185,8 +190,9 @@ export function createEnemySystem(ctx: GameContext): EnemySystem {
       const actor = byId.get(enemyId);
       if (!actor || !actor.alive) return false;
       clearDamageInfo(world);
+      // Always a world kill: never rewarded, and the kind's onKilled deals no damage for it.
       world.amount = actor.hp; world.type = 'hazard'; world.weapon = 'world';
-      world.silent = opts.silent ?? false; world.creditPlayer = opts.creditPlayer ?? false;
+      world.silent = opts.silent ?? false;
       world.point.copy(actor.aimPoint);
       die(actor, world, false);
       return true;

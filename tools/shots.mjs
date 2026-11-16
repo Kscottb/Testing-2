@@ -3,6 +3,7 @@
 // Writes: menu (+ the difficulty / settings / controls screens when the UI has them), gameplay in each
 // zone / time of day, every enemy type, every weapon viewmodel, perk screen, pause, game over, victory,
 // and a 390x844 touch layout (with real touches on the touch controls when they exist).
+// The desktop tour runs on the "high" quality preset; the touch tour keeps what 'auto' gives a phone.
 import path from 'node:path';
 import { gameErrors, launchGame, parseArgs } from './harness.mjs';
 
@@ -45,6 +46,11 @@ async function tour(game) {
     }
     return s;
   };
+
+  // 'auto' resolves to 'medium' on the software renderer of the harness: the tour shows the reference
+  // preset of the brief instead.
+  await sh((SH) => SH.setQuality('high'));
+  if ((await sh((SH) => SH.state().quality)) !== 'high') notes.push('the "high" quality preset could not be applied');
 
   // --- menu ---
   await step(1.5, { render: 30 });

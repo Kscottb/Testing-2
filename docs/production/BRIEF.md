@@ -28,7 +28,8 @@ the storm-core machine nesting on the Core Spire.
 
 - TypeScript (strict), Vite, **three@0.187** (`import * as THREE from 'three'`, addons from `three/addons/...`).
   No other runtime dependencies. Never `npm install` anything. WebGLRenderer (WebGL2), not WebGPU.
-- Units: metres, seconds, radians. Y up. Player yaw 0 looks down **-Z**.
+- Units: metres, seconds, radians. Y up. Player yaw 0 looks down **-Z**; positive yaw turns left, positive
+  pitch looks up. Colours passed as numbers are sRGB `0xRRGGBB`.
 - No external network requests at runtime except an optional Google Fonts stylesheet link (must degrade to a
   system fallback stack). No asset files.
 - The game is later repackaged as a single inline page inside a sandboxed frame. Therefore:
@@ -37,15 +38,17 @@ the storm-core machine nesting on the Core Spire.
   - **pointer lock and fullscreen are optional**: always handle rejection; the game must be fully playable
     without pointer lock (fallback look modes) — see Input;
   - audio may only start after a user gesture (the Start button);
-  - never depend on URL query strings in normal play (tests may use `?test=1`);
+  - never depend on URL query strings in normal play (test mode is opt-in: `?test=1`, or a host frame named
+    `sh-test` where no query string exists);
   - size the app with `height:100%` on `html, body` (not `100vh`); edge-anchored UI adds
     `env(safe-area-inset-*, 0px)` to its padding; side gutters ≥ 16px.
   - single deliberate dark look: set `color-scheme: dark` on `:root`, define every colour as a CSS custom
     property on `:root`, give `body` an explicit background.
 - Performance budget (target 60 fps at 1080p on integrated graphics, "High" preset):
-  - lights: 1 shadow-casting directional sun + 1 hemisphere + a **fixed pool of 6 point lights owned by FX**
-    (never add/remove lights at runtime — changing light count recompiles every shader; park unused pool lights
-    at intensity 0). World geometry uses emissive materials + bloom instead of real lights.
+  - lights: 1 shadow-casting directional sun + 1 hemisphere (render) + a **fixed pool of 6 point lights owned by
+    FX**, plus render's small fixed light rig for the first-person layer. Nobody else adds a light, and the
+    light count never changes at runtime (it recompiles every shader; park unused pool lights at intensity 0).
+    World geometry, enemies and weapons use emissive materials + bloom instead of real lights.
   - draw calls: world ≤ 150 (merge static geometry per material, InstancedMesh for repeats), each regular enemy
     ≤ 8 meshes (boss ≤ 40), all FX ≤ 25 batches, viewmodel ≤ 12. ≤ 600k triangles on screen.
   - no per-frame heap allocation in hot paths: module-level scratch vectors, pools for projectiles / particles /
@@ -64,7 +67,8 @@ Keyboard/mouse: WASD move · mouse look · LMB fire · RMB aim-down-sights · R 
 C crouch / slide (never bind Ctrl — Ctrl+W closes the tab) · Q dash · F Overclock · V melee · G grenade ·
 1-4 weapons · wheel cycle · Esc/P pause · 1/2/3 choose perk. Arrow keys also turn the view (fallback look).
 Gamepad: LS move · RS look · RT fire · LT aim · X reload · A jump · B crouch/slide · LB dash · RB grenade ·
-Y next weapon · R3 melee · L3 sprint · D-pad up Overclock · Start pause · X/Y/B (or D-pad L/U/R) choose perk.
+Y next weapon · D-pad down previous weapon · R3 melee · L3 sprint · D-pad up Overclock · Start pause ·
+X/Y/B choose perk (never the D-pad: it navigates menus).
 Touch: left virtual stick (auto-sprint at full deflection) · right half drag-to-look · on-screen buttons for
 fire / jump / dash / reload / grenade / melee / weapon swap / Overclock / pause. Touch + gamepad get mild aim
 assist.
@@ -77,14 +81,14 @@ assist.
 - Collision AABB 0.7 × 1.8 × 0.7 (crouch 1.1 tall), eye 1.65 (crouch 1.0), auto step-up 0.45 m.
 - **OVERCLOCK** (signature ability, F): a meter charged by kills (more for weak-point kills and combos). At 100,
   activate for 6 s: world time scale drops to 0.4 while the player moves, aims and shoots at full speed; no ammo
-  consumption; strong audiovisual treatment.
+  consumption (grenades are still used up); strong audiovisual treatment.
 
 ### Arsenal (start with VECTOR; others arrive by supply drop after waves 1, 4, 6)
 | id | name | behaviour |
 |---|---|---|
 | `vector` | VECTOR-7 pulse rifle | auto hitscan, 720 rpm, 14 dmg, mag 36, mild recoil pattern, ADS 1.35× |
 | `breaker` | BREAKER scattergun | 9 pellets × 11 dmg, 75 rpm pump, mag 6, brutal close range, strong knockback |
-| `lance` | LANCE rail rifle | hold to charge 0.6 s, piercing beam 160 dmg through all targets, mag 5, ADS 2.5× scope |
+| `lance` | LANCE rail rifle | hold to charge 0.6 s — fires by itself at full charge, letting go earlier cancels; piercing beam 160 dmg through all targets, mag 5, ADS 2.5× scope |
 | `hornet` | HORNET micro-missile launcher | rockets 45 m/s, 90 splash dmg r=5 m (self damage ×0.35), mag 4 |
 Plus frag grenades (G; carry 2; 140 dmg r=6.5 m; bounce; 1.6 s fuse) and a suit melee strike (V; 80 dmg, 2.4 m
 cone, 0.7 s cooldown, small lunge). Weak-point hits are crits (default ×2). Ammo: magazine + reserve, refilled by
@@ -94,7 +98,7 @@ pickups. Falloff on vector/breaker. Dynamic crosshair spread (move/jump/fire wid
 | id | role | notes |
 |---|---|---|
 | `skitter` | swarm melee crawler | HP 40, 7.5 m/s, leaps from ~5 m, 10 dmg bite; arrives in packs |
-| `riveter` | hovering gun platform | HP 90, 4 m/s, strafes at 10-28 m, 3-round plasma bursts (32 m/s bolts, 9 dmg); weak point: eye |
+| `riveter` | hovering gun platform | HP 90, 4 m/s, strafes at 10-28 m, 3-round plasma bursts (32 m/s bolts, 9 dmg); weak point: eye. Hovers low but paths on the nav grid like a ground unit (only wasp and boss truly fly) |
 | `wasp` | flying harasser | HP 55, 9 m/s at 4-9 m altitude, strafing runs with rapid light bolts (5 dmg) |
 | `tick` | rolling bomb | HP 30, 9.5 m/s, accelerating beeps, detonates at 2.2 m (45 dmg r=5, hurts enemies too → chain reactions); explodes when shot |
 | `lancer` | tripod sniper | HP 120, holds 25-45 m, 1.6 s visible tracking laser that locks 0.3 s before a 40 dmg beam; relocates |
@@ -110,13 +114,14 @@ crit damage. Big staged death: chain explosions, slow motion, white-out, victory
 AI rules: ground units path with a shared flow field on the nav grid; flyers steer directly with obstacle
 avoidance; separation between units; line-of-sight checks before firing; a global *attack token* budget so the
 player is never shot by everything at once; every ranged attack has an audiovisual telegraph ≥ 0.35 s. Enemies
-spawn via a **lightning-strike arrival**: a ground ring telegraph (~0.8 s), a bolt from the sky, then the machine.
+spawn via a **lightning-strike arrival**: a ground ring telegraph (~0.8 s), a bolt from the sky, then the machine
+(the boss skips it and stages its own intro).
 
 ### Structure
 - One continuous map, three zones opening west→east: **Landing Deck** (waves 1-3) → **Refinery** (unlocks after
   wave 3) → **Core Spire** (unlocks after wave 6; boss arena). Energy gates between zones.
-- 10 waves. Wave 10 is the boss. Between waves: weapon supply drop (if due), then **perk choice** (pick 1 of 3,
-  world frozen while choosing), then a short intermission countdown.
+- 10 waves. Wave 10 is the boss. Between waves: zone unlock and weapon supply drop (when due), then **perk
+  choice** (pick 1 of up to 3, world frozen while choosing), then a short intermission countdown.
 - Time-of-day arc tied to progress: waves 1-3 *Amber Dusk* → 4-6 *Violet Twilight* → 7-9 *Stormnight* (lightning,
   rain-like static) → boss *Eclipse* (red-magenta vortex over the Spire).
 - Perks (roguelite, some stack): damage, fire rate, mag size, reload speed, max shield, max health, faster shield
@@ -141,8 +146,11 @@ spawn via a **lightning-strike arrival**: a ground ring telegraph (~0.8 s), a bo
   anything else; this is how the player reads a fight.
 - **Enemies**: dark gunmetal chassis, one saturated emissive accent, exaggerated silhouettes distinct from 30 m.
 - **Weapons (first-person)**: graphite + off-white shells, cyan emissive readouts; chunky and legible.
-- **Post**: ACES-style filmic tone map, HDR bloom on emissives, subtle vignette + chromatic aberration + grain,
-  colour grade per time-of-day. Reactive: damage flash, low-health desaturation/pulse, Overclock treatment.
+- **Post**: the frame is always rendered in linear HDR and tone-mapped once in render's final pass, on every
+  quality preset (presets only switch bloom, film effects, shadows and resolution). ACES-style filmic tone map,
+  HDR bloom on emissives, subtle vignette + chromatic aberration + grain, colour grade per time-of-day.
+  Reactive: damage flash, low-health desaturation/pulse, Overclock treatment — drawn by render only, never by
+  CSS overlays.
 - **UI**: precise military-tech HUD — thin lines, cut corners, small caps with letter-spacing, generous negative
   space; cyan primary, amber warning, red danger. Type: a characterful display face for titles (e.g. "Chakra
   Petch"), a condensed UI face (e.g. "Barlow Condensed"), a mono for data (e.g. "Share Tech Mono"); each with a
@@ -155,40 +163,55 @@ loud and punchy with per-shot variation. Enemies each have a signature motif (sk
 lancer charge whine, bulwark servo groans). Explosions have sub-bass. Spatialised 3D sound (PannerNode), light
 generated-impulse reverb, master compressor/limiter (no clipping with 30 simultaneous voices; voice cap +
 priority). Adaptive music: dark driving synth score built from layers (pad, bass, arp, drums, lead) whose mix
-follows combat intensity; distinct menu ambience, boss theme, victory and defeat stingers. Storm wind bed.
+follows combat intensity; distinct menu ambience, boss theme, victory and defeat stingers. Storm wind and
+static-rain beds are audio's own; the storm's one-shots (thunder, crackle, gusts) are scheduled by FX weather
+together with the lightning they belong to. Audio drives the music by itself from game events.
 
 ## 6. Architecture
 
 ```
-index.html
-src/main.ts                bootstrap
-src/core/                  FOUNDATION (frozen contract): types.ts, events, context, game.ts (state machine +
-                           frame pipeline), loop, input, settings, storage, math, rng, pool, palette, debug
-src/data/                  tuning tables (weapons, enemies, waves, perks, difficulty)
-src/physics/               CollisionWorld: static AABBs, move-and-slide with step-up, raycasts, overlap queries
-src/nav/                   2.5D nav grid, flow fields, LOS helpers
-src/combat/                hit volumes, damage pipeline, projectiles, explosions
+index.html                 static shell: canvas, #ui, boot screen, fatal panel, design tokens (ownership: §7)
+src/main.ts                bootstrap (finished)
+src/core/                  FOUNDATION: types.ts (the code contract), constants, events, context, game.ts (state
+                           machine + frame pipeline), loop, input, settings, storage, time, math, make, rng, pool,
+                           palette, fatal, debug (window.__SH), bot
+src/data/                  tuning tables: weapons, enemies, projectiles, waves, perks, pickups, difficulty,
+                           timeOfDay, quality (who may tune which: types.ts header "DATA TABLES")
+src/physics/               CollisionWorld: static AABBs, move-and-slide with step-up, raycasts, overlap (finished)
+src/nav/                   2.5D nav grid, flow fields, paths (finished)
+src/combat/                hit targets, traces, damage routing, projectiles, explosions, hit-confirm feedback
 src/world/                 level layout, builder, materials/textures, props, gates, hazards, jump pads
-src/render/                renderer, sky, lighting + time-of-day, post FX, quality + dynamic resolution, cinematic cams
-src/player/                controller, camera feel, vitals, dash, Overclock
+src/render/                renderer, sky, lighting + time-of-day, post FX, quality + dynamic resolution, cinematic
+                           cams, the reaction to lightning (it never schedules it)
+src/player/                controller, camera feel + shake, vitals, dash, Overclock
 src/weapons/               weapon logic, first-person viewmodels + animation, grenades, melee
-src/enemies/               manager, base, AI utilities, enemy kinds, boss
-src/director/              waves, spawning, pickups, perks, score/combo, progression, supply drops
-src/fx/                    particles, decals, tracers/beams, explosions, damage numbers, weather, light pool, shake
-src/audio/                 engine, SFX synth library, adaptive music
+src/enemies/               index.ts = the manager · kinds/<type>.ts = one file per enemy kind · kinds/index.ts =
+                           the registration list · boss/ = helpers of the conductor (layout fixed by types.ts)
+src/director/              waves, spawning, pickups, perks, score/combo, progression, supply drops, end of run
+src/fx/                    particles, decals, tracers/beams, bolts, telegraphs, trails, damage numbers, light pool,
+                           weather incl. the ambient storm (lightning + thunder scheduling)
+src/audio/                 engine, SFX synth library, adaptive music, wind / static-rain beds
 src/ui/                    HUD, menus, perk select, settings, minimap, touch controls, CSS
-tools/                     Playwright harness + smoke / campaign / screenshot CLIs
+tools/                     Playwright harness + smoke / campaign / screenshot CLIs (part of the foundation)
 ```
 
 - Every system implements the lifecycle in `src/core/types.ts` and receives the shared `GameContext`. Systems talk
   through **interfaces on the context** (queries/commands) and the **typed event bus** (notifications).
+  A factory only stores `ctx` (the other systems do not exist yet); real work starts in `init()`. `reset()` is
+  silent and idempotent — no fx, no sounds, no animations — and it kills every audio loop, so loops are started
+  from `update`, never from `init()` or `reset()`.
 - **Feedback ownership rule**: the gameplay system that owns a moment triggers its own FX and audio by explicit
-  calls (`ctx.fx...`, `ctx.audio...`). FX and Audio do *not* subscribe to gameplay events to spawn effects/sounds
-  (so nothing double-fires), except the small set documented in `types.ts` (e.g. music follows game/wave state).
-  UI is the opposite: it never gets called by gameplay; it reads state from the context each frame and listens
-  to events.
-- Time: `ctx.time` carries scaled `dt` (world) and `unscaledDt` (player/UI); Overclock, hit-stop and slow-motion
-  are implemented through the world time scale.
+  calls (`ctx.fx...`, `ctx.audio...`, `ctx.render...`). Every FxId / SoundId / LoopId in `types.ts` is declared
+  in the union of its one owner; your assignment's "Contract pointers" names yours. FX and Audio do *not*
+  subscribe to gameplay events to spawn effects/sounds (so nothing double-fires), except the small set listed in
+  `types.ts` (music follows game/wave state; weather and ambience beds follow time-of-day). The ambient storm is
+  FX weather's: it schedules each strike and calls render (flash) and audio (thunder); render and audio never
+  start one themselves. UI is the opposite: it never gets called by gameplay; it reads state from the context
+  each frame and listens to events.
+- Time: `ctx.time` carries three clocks — scaled `dt` (enemies, combat, world, director, fx), `unscaledDt`
+  (player, weapons: full speed during Overclock) and `realDt` (render, audio, ui: never stops) — plus `playerDt`
+  for player-owned things inside world-clock systems. Overclock, hit-stop, slow-motion and the perk-select
+  freeze are layered requests on the world time scale (one owner per source); nobody multiplies dt by hand.
 - The world is static axis-aligned boxes for collision (ramps are stair-stepped in collision with a smooth
   visual mesh). Level heights are terraces, never overlapping walkable layers, so the nav grid is 2.5D.
 - First-person weapons render in a separate view scene/camera composited after the world (no wall clipping).
@@ -197,18 +220,32 @@ tools/                     Playwright harness + smoke / campaign / screenshot CL
 
 ## 7. Working rules for agents (several agents edit this repo at the same time)
 
-- **Only create/edit files inside the paths you are assigned.** Other directories are being written by other
-  agents right now. Read anything; write only your own.
-- `src/core/**` is the frozen contract. If you believe it needs a change, do NOT edit it: finish your work
+- **Only create/edit files inside the paths you are assigned** — the exact list is under "Contract pointers" in
+  your assignment. Other directories are being written by other agents right now. Read anything; write only
+  your own. `src/main.ts`, `src/physics`, `src/nav` and `tools/` are finished foundation code: use them, do not
+  edit them (the one exception is named in the audio assignment).
+- `src/core/**` is frozen for everyone. If you believe it needs a change, do NOT edit it: finish your work
   against the current contract (work around locally if needed) and report the request in your final output.
+- `index.html` belongs to the UI engineer, and to nobody else: styles and the static shell only (no game logic).
+  Core drives the boot screen and the fatal panel through it, so `#game`, `#ui`, `#boot`, `#boot-bar`,
+  `#boot-label`, `#fatal`, `#fatal-title`, `#fatal-message`, `#fatal-detail`, `#fatal-reload`, the inline
+  safety-net script and the module script tag must keep working exactly as they do now.
+- `src/data/*.ts`: the table types, export names and shapes are frozen; only the values are tuned, and only by
+  the owner named in the `types.ts` header (repeated in your assignment). Everyone else reads the tables and
+  never hard-codes a copy of a number.
 - Never run state-changing git commands (no commit, add, stash, checkout, reset, clean, restore). Never install
   packages. Never edit package.json, tsconfig, vite config.
 - Type-check with `npx tsc --noEmit 2>&1 | grep -E "^src/<your-dir>/"` — errors in other directories belong to
   other agents mid-edit; ignore them. Your own files must be error-free. Run your unit tests with
-  `npx vitest run src/<your-dir>`.
+  `npx vitest run src/<your-dir>` (tests are `src/<dir>/*.test.ts` and run in node: no DOM, no WebGL, no
+  AudioContext — keep the logic under test free of them).
 - Do not run `npm run build` or anything that writes `dist/` unless your assignment says so.
 - For visual checks use the harness in `tools/` in **dev mode on your assigned port** (never another port, never
-  kill processes you did not start). If the page fails to load because of errors outside your directory, wait
+  kill processes you did not start): `tools/smoke.mjs`, `tools/shots.mjs` and `tools/campaign.mjs` take
+  `--port`, and your own throwaway scripts (kept in your scratch directory) can import `launchGame` from
+  `tools/harness.mjs` and drive `window.__SH`. The harness opens the page in test mode: the simulation only
+  advances through `step()`. The sandboxed-frame mode (`embed: 'sandbox'`) needs a `dist` build and is therefore
+  an integration check, not yours. If the page fails to load because of errors outside your directory, wait
   ~90 s and retry (max 3 times), then carry on without the visual check and say so in your report.
 - Put temporary files only under the scratch directory given in your assignment — never in the repo.
 - Report honestly: what is done, what is not, what you could not verify.

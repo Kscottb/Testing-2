@@ -24,6 +24,8 @@ async function manualRun(game) {
   let s = await sh((SH) => SH.state());
   check('boots into the menu', s.mode === 'menu', `mode=${s.mode}`);
   check('manual stepping mode is active', await sh((SH) => SH.manual));
+  // The harness asks the browser for reduced motion; test mode must not turn that into reduced flashes.
+  check('test mode ignores the OS reduced-motion preference', (await sh((SH) => SH.ctx.settings.data.reduceFlashes)) === false);
   s = await step(0.5, { render: true });
   check('menu renders something', s.drawCalls > 0, `drawCalls=${s.drawCalls}`);
   check('the UI reports the menu screen', s.uiScreen === 'menu', `uiScreen=${s.uiScreen}`);
@@ -202,6 +204,55 @@ async function manualRun(game) {
   await sh((SH) => SH.menu());
   s = await step(0.2, { render: true });
   check('returning to the menu resets the world', s.mode === 'menu' && s.enemiesAlive === 0 && s.timeOfDay === 'dusk', `mode=${s.mode}`);
+
+  // --- end of run around the boss (END OF RUN + boss watchdog of the contract) -----------------
+  /** Start a run on the boss wave and wait for the boss; returns its id (0 when it never came). */
+  const toBoss = async () => {
+    await sh((SH) => {
+      SH.start('veteran');
+      SH.god(true);
+      SH.freezeAi(true);
+      SH.setWave(10);
+    });
+    for (let i = 0; i < 80; i++) {
+      s = await step(0.5);
+      if (s.boss) break;
+    }
+    await sh((SH) => SH.god(false));
+    return sh((SH) => (SH.ctx.enemies.boss ? SH.ctx.enemies.boss.id : 0));
+  };
+
+  // The boss dies with an add next to the player, and the player takes a lethal hit right behind it.
+  let bossId = await toBoss();
+  check('the boss wave brings the boss', bossId > 0 && s.phase === 'boss', `phase=${s.phase} boss=${JSON.stringify(s.boss)}`);
+  await sh((SH, id) => {
+    const p = SH.ctx.player.position;
+    SH.spawn('tick', p.x + 2, p.y, p.z);
+    SH.ctx.enemies.kill(id);
+    SH.damagePlayer(100000);
+  }, bossId);
+  s = await step(1);
+  check('a defeated boss decides the run and takes its adds with it', s.phase === 'done' && s.enemiesAlive === 0, `phase=${s.phase} alive=${s.enemiesAlive}`);
+  check('nothing can kill the player once the boss is defeated', s.player.alive && s.player.hp > 0, `hp=${s.player.hp}`);
+  for (let i = 0; i < 60 && s.mode === 'playing'; i++) s = await step(0.5);
+  check('the staged death ends in victory', s.mode === 'victory' && s.stats.victory === true, `mode=${s.mode}`);
+
+  // The boss disappears without being defeated (what the error containment does to a broken boss).
+  bossId = await toBoss();
+  await sh((SH, id) => SH.ctx.enemies.kill(id, { silent: true }), bossId);
+  for (let i = 0; i < 10 && s.mode === 'playing'; i++) s = await step(0.5);
+  check('a boss that vanished without being defeated still ends the fight', s.mode === 'victory', `mode=${s.mode} phase=${s.phase}`);
+
+  // The other order: the player dies first, then the boss goes down.
+  bossId = await toBoss();
+  await sh((SH, id) => {
+    SH.damagePlayer(100000);
+    SH.ctx.enemies.kill(id);
+  }, bossId);
+  for (let i = 0; i < 40 && s.mode === 'playing'; i++) s = await step(0.5);
+  check('the player dying first decides the run: game over, whatever happens to the boss afterwards', s.mode === 'gameover' && s.stats.victory === false, `mode=${s.mode}`);
+  await sh((SH) => SH.menu());
+  await step(0.2);
 }
 
 /**
@@ -217,6 +268,8 @@ async function sandboxRun(game) {
   check('boots into the menu inside a sandboxed frame', s.mode === 'menu', `mode=${s.mode}`);
   check('test mode stays off without an opt-in', !(await sh((SH) => SH.manual || SH.ctx.testMode)));
   check('storage falls back to memory', (await sh((SH) => SH.ctx.storage.persistent)) === false);
+  // Normal play follows the OS (the harness asks the browser for reduced motion).
+  check('reduced flashes follow the OS preference outside test mode', (await sh((SH) => SH.ctx.settings.data.reduceFlashes)) === true);
   const frame0 = s.frame;
   await wait(400);
   s = await state();

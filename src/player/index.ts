@@ -22,7 +22,7 @@ export function createPlayerSystem(ctx: GameContext): PlayerSystem {
   const speedMuls = new Map<string, number>();
   const dash = { charges: 1, maxCharges: 1, cooldownLeft: 0, cooldown: PLAYER.DASH_COOLDOWN as number, active: false };
   const overclock = { charge: 0, ready: false, active: false, timeLeft: 0, duration: PLAYER.OVERCLOCK_SECONDS as number };
-  let yaw = 0, pitch = 0, grounded = false, hp = 100, shield = 100, alive = true, lastHit = -99, dashLeft = 0, ads = 0, adsZoom = 1, adsMove = 1, lastStandUsed = 0, shake = 0, launched = false;
+  let yaw = 0, pitch = 0, grounded = false, hp = 100, shield = 100, alive = true, lastHit = -99, dashLeft = 0, ads = 0, adsZoom = 1, adsMove = 1, lastStandUsed = 0, shake = 0, launched = false, bossDown = false;
   const targetId = ctx.nextId();
   const target: HitTarget = { id: targetId, faction: 'player', alive: true, center, boundRadius: 0.9, spheres: [body], takeDamage: (info) => player.takeDamage(info), enemy: null };
 
@@ -61,7 +61,7 @@ export function createPlayerSystem(ctx: GameContext): PlayerSystem {
     get shield() { return shield; },
     get maxShield() { return PLAYER.MAX_SHIELD + ctx.mods.maxShieldBonus; },
     get alive() { return alive; },
-    get invulnerable() { return ctx.debug.god || dashLeft > 0; },
+    get invulnerable() { return ctx.debug.god || dashLeft > 0 || bossDown; },
     get fov() { return ctx.camera.fov; },
     get lastStandCharges() { return Math.max(0, ctx.mods.lastStand - lastStandUsed); },
 
@@ -162,6 +162,9 @@ export function createPlayerSystem(ctx: GameContext): PlayerSystem {
         if (!overclock.active) player.addOverclockCharge(ENEMIES[e.type].overclockCharge * (e.crit ? 1.5 : 1) * (1 + 0.1 * (ctx.director.combo.multiplier - 1)));
         if (ctx.mods.lifeOnKill > 0 && player.heal(ctx.mods.lifeOnKill) > 0) ctx.fx.spawn('lifeSteal', center);
       });
+      // The fight is won: from here until the next reset() nothing can hurt the player (cleanup blasts,
+      // hazards or a fall during the staged death must not kill the victor).
+      ctx.events.on('boss:defeated', () => { bossDown = true; });
       // The boss gives no charge on death: 1 point per 150 damage dealt to it instead.
       ctx.events.on('hit:confirmed', (e) => {
         if (alive && !overclock.active && ctx.enemies.boss?.id === e.targetId) player.addOverclockCharge(e.amount / 150);
@@ -169,7 +172,7 @@ export function createPlayerSystem(ctx: GameContext): PlayerSystem {
     },
     reset(): void {
       hp = player.maxHp; shield = player.maxShield; alive = true; target.alive = true; lastHit = -99; dashLeft = 0; ads = 0; adsZoom = 1; adsMove = 1; shake = 0;
-      lastStandUsed = 0; grounded = false; launched = false; speedMuls.clear();
+      lastStandUsed = 0; grounded = false; launched = false; bossDown = false; speedMuls.clear();
       Object.assign(dash, { charges: 1, maxCharges: 1, cooldownLeft: 0, active: false });
       Object.assign(overclock, { charge: 0, ready: false, active: false, timeLeft: 0 });
       ctx.time.clearScale('overclock');

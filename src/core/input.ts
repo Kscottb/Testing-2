@@ -216,12 +216,18 @@ function isInteractive(target: EventTarget | null): boolean {
   return el !== null && el.closest('button,a,input,select,textarea,[role="button"],[role="slider"],[tabindex]') !== null;
 }
 
-/** Controls whose native arrow-key behaviour must survive (sliders, selects, radio groups). */
-function usesArrowKeys(target: EventTarget | null): boolean {
+/**
+ * Value controls (sliders, selects, radio groups): ArrowLeft / ArrowRight keep their native action there
+ * because they change the value. ArrowUp / ArrowDown never do — on every control they only move focus
+ * (see FOCUS AND NAVIGATION at UiSystem), or one key press would both change the value and leave it.
+ */
+function ownsHorizontalArrows(target: EventTarget | null): boolean {
   const el = asElement(target);
   if (!el) return false;
-  const tag = el.tagName;
-  return tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA' || el.getAttribute('role') === 'slider';
+  if (el.tagName === 'SELECT' || el.getAttribute('role') === 'slider') return true;
+  if (el.tagName !== 'INPUT') return false;
+  const type = (el.getAttribute('type') ?? '').toLowerCase();
+  return type === 'range' || type === 'radio';
 }
 
 /** Touch-only device (phone / tablet without a mouse): the first prompts must be touch glyphs. */
@@ -462,14 +468,11 @@ export function createInput(options: InputOptions): Input {
       const functionKey = /^F\d{1,2}$/.test(e.code);
       if (e.code !== 'Escape' && !functionKey) {
         // While gameplay owns the input every key is ours. In menus: arrows must never scroll the page
-        // (or the page that embeds us) — except on sliders / selects, which need them — and Space must
-        // keep activating a focused button.
+        // (or the page that embeds us) — only the horizontal ones keep their native action, and only
+        // on a value control — and Space must keep activating a focused button.
         const arrow = e.code.startsWith('Arrow');
-        if (
-          wantsCapture ||
-          (arrow && !usesArrowKeys(e.target)) ||
-          (e.code === 'Space' && !isInteractive(e.target))
-        ) {
+        const nativeArrow = (e.code === 'ArrowLeft' || e.code === 'ArrowRight') && ownsHorizontalArrows(e.target);
+        if (wantsCapture || (arrow && !nativeArrow) || (e.code === 'Space' && !isInteractive(e.target))) {
           e.preventDefault();
         }
       }

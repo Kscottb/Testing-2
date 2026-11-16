@@ -1,8 +1,11 @@
 // STUB: replaced by the ui team
-import { DIFFICULTIES } from '../core/constants';
+import { DIFFICULTIES, PERK_INPUT_GUARD_SECONDS } from '../core/constants';
 import { DIFFICULTY } from '../data/difficulty';
 import { PERKS } from '../data/perks';
 import type { GameContext, UiScreen, UiSystem } from '../core/types';
+
+/** A screen ignores every activation (mouse click, native Enter / Space, gamepad confirm) this long after it opens. */
+const ACTIVATION_GUARD_SECONDS = 0.3;
 
 const STYLE = `
 .sh-hud{position:absolute;left:max(16px,env(safe-area-inset-left,0px));bottom:max(16px,env(safe-area-inset-bottom,0px));font:14px/1.5 var(--sh-font-mono);color:var(--sh-text);white-space:pre;text-shadow:0 1px 2px #000}
@@ -24,21 +27,30 @@ export function createUiSystem(ctx: GameContext): UiSystem {
   const cross = document.createElement('div');
   const panel = document.createElement('div');
   let panelKey = '';
+  /** ctx.time.elapsed when the current panel opened. */
+  let panelOpenedAt = 0;
   let banner = '';
   let bannerLeft = 0;
   let fatal = false;
 
-  const button = (label: string, onClick: () => void, id: string): HTMLButtonElement => {
+  /** `unlocked` overrides the screen's own activation guard (perk cards share the lock of the perk keys). */
+  const button = (label: string, onClick: () => void, id: string, unlocked?: () => boolean): HTMLButtonElement => {
     const el = document.createElement('button');
     el.className = 'sh-btn';
     el.textContent = label;
     el.dataset.action = id;
-    el.addEventListener('click', onClick);
+    // The guard sits in the click handler: it covers the mouse, the native Enter / Space click (Space is
+    // also the jump key) and a gamepad confirm alike.
+    el.addEventListener('click', () => {
+      if (unlocked ? unlocked() : ctx.time.elapsed - panelOpenedAt >= ACTIVATION_GUARD_SECONDS) onClick();
+    });
     return el;
   };
+  const perkUnlocked = (): boolean => ctx.time.elapsed - ctx.director.perkOfferedAt >= PERK_INPUT_GUARD_SECONDS;
   const show = (key: string, title: string, sub: string, buttons: HTMLButtonElement[]): void => {
     if (key === panelKey) return;
     panelKey = key;
+    panelOpenedAt = ctx.time.elapsed;
     panel.replaceChildren();
     panel.hidden = key === '';
     if (key === '') return;
@@ -118,7 +130,7 @@ export function createUiSystem(ctx: GameContext): UiSystem {
       } else if (mode === 'victory') {
         show('victory', 'RIG SECURED', `SCORE ${director.score}  ·  GRADE ${director.stats.grade}`, endButtons());
       } else if (offer) {
-        show(`perk-${director.wave}`, 'CHOOSE A PERK', 'PRESS 1 / 2 / 3', offer.map((id, i) => button(`${i + 1}  ${PERKS[id].name} — ${PERKS[id].description}`, () => ctx.director.choosePerk(i), `perk-${i}`)));
+        show(`perk-${director.wave}`, 'CHOOSE A PERK', 'PRESS 1 / 2 / 3', offer.map((id, i) => button(`${i + 1}  ${PERKS[id].name} — ${PERKS[id].description}`, () => ctx.director.choosePerk(i), `perk-${i}`, perkUnlocked)));
       } else {
         show('', '', '', []);
       }

@@ -161,7 +161,8 @@ export function createRenderSystem(ctx: GameContext): RenderSystem {
       ctx.events.emit('quality:changed', { preset: quality, params: QUALITY[quality] });
     },
     screenFlash(color: number, intensity: number): void {
-      // Strongest wins: a weak blast never recolours a strong lightning flash.
+      // Strongest wins: a weak blast never recolours a strong white-out. (Lightning never comes through
+      // here: lightningFlash adds its own capped post flash.)
       if (intensity > post.flash) {
         post.flash = Math.min(1, intensity);
         post.flashColor = color;

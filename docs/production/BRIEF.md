@@ -249,3 +249,40 @@ tools/                     Playwright harness + smoke / campaign / screenshot CL
   ~90 s and retry (max 3 times), then carry on without the visual check and say so in your report.
 - Put temporary files only under the scratch directory given in your assignment — never in the repo.
 - Report honestly: what is done, what is not, what you could not verify.
+
+## 8. Rulings on questions the contract leaves open
+
+These settle points where two engineers could otherwise guess differently. The contract still wins on API detail.
+
+- **Boss volume**: the Conductor hovers at `bossArena.center` + `hoverHeight`; the conductor row's `hoverMin` /
+  `hoverMax` are **offsets** around that anchor (its bob range), not absolute altitudes. The world keeps a clear
+  cylinder around the anchor — radius 12 m, from 5 m above the arena floor up to 26 m — free of **all** geometry,
+  solid or visual. The central spire ends below it (it may continue above 26 m only as distant set dressing
+  outside the cylinder).
+- **FX recipes are particles only**: an `fx.spawn` recipe never contains a decal or a light. The owner of the
+  moment calls `fx.decal` and `fx.lightFlash` itself.
+- **`audio.duck`** has no gameplay caller: only the audio system uses it internally (for example under stingers).
+- **Reactive post params** (damage vignette, low-health pulse, Overclock treatment, dash blur, ADS vignette,
+  chromatic boost) are drawn on **every** quality preset; `filmEffects` only switches the constant cosmetic
+  vignette / aberration / grain.
+- **Time of day**: `WaveDef.timeOfDay` (director's table) is authoritative. `TimeOfDayDef.waveFrom/waveTo` are
+  informational and nothing derives the schedule from them.
+- **Colour of elites**: lancer and bulwark use the elite magenta accent (`#ff2a7a`) like the boss; skitter,
+  riveter, wasp and tick use the enemy orange-red. The elite engineer sets the accent in their rows.
+- **Wide enemies**: the nav grid is built for a 0.4 m agent. The bulwark steers by the nav grid with its centre
+  and additionally keeps its body out of walls with collision overlap probes; the world keeps every route a
+  heavy unit needs (from heavy spawn points to the open floor of its zone) at least 4 m wide.
+- **Air spawns**: the arrival telegraph ring goes on the floor under the hover point.
+- **Difficulty and the boss**: the conductor reads the run's difficulty from the director to scale its cadence;
+  there is no modifier field for it.
+- **`WeaponDef.moveMul`**: weapons apply it through `player.setSpeedMultiplier('weapon', …)` and restore it on
+  mode change and reset.
+- **Footsteps on `glass` and `energy`** surfaces fall back to the `metal` step sounds.
+- **Damage number colours**: body hits near-white (`#e8f1f5`); weak-point hits pale gold (`#fff2b0`) and larger;
+  armour hits dim grey (`#8aa0ad`) and smaller; shield-absorbed hits pale cyan (`#9fefff`). Never hazard yellow.
+- **Tick packs** may detonate within one simulation substep (the explosion queue resolves chains immediately);
+  no artificial ripple delay.
+- **Boss intro** is timed by the director's `bossIntro` phase as the contract says; the boss appears at its
+  anchor wherever the player is, and the objective marker leads the player to the Spire.
+- **Interrupted work**: if your directory already contains more than the stub when you start, a previous attempt
+  at your assignment was interrupted. Read what is there and continue from it; do not start over.

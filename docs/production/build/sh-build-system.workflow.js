@@ -7,7 +7,8 @@ export const meta = {
 }
 
 const REPO = '/home/user/Testing-2'
-const SCRATCH = '/tmp/claude-0/-home-user-Testing-2/6bb73113-d5ad-55b7-9619-608c6eaa77e8/scratchpad'
+// Pass the session's scratch directory as args.scratch; the literal is only a fallback.
+const SCRATCH = (args && args.scratch) || '/tmp/claude-0/-home-user-Testing-2/6bb73113-d5ad-55b7-9619-608c6eaa77e8/scratchpad'
 const DOCS = REPO + '/docs/production'
 const BRIEF = DOCS + '/BRIEF.md'
 

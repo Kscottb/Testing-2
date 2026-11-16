@@ -24,14 +24,44 @@ Everything needed to resume is in this folder.
 | `node tools/smoke.mjs --mode dist` | 48 of 48 checks |
 | `node tools/campaign.mjs --mode dist --god 1` | bot reaches victory |
 
-Build order for the remaining systems (two at a time; each is launched with
-`build/sh-build-system.workflow.js` and the module key):
-
-- Lane A: world -> player -> weapons -> director -> ui
-- Lane B: render -> enemies-core -> enemies-elite -> boss -> audio
-
 Each system's report (contract requests, judgement calls, integration notes, open issues) is saved as
 `build/<system>.report.json` and feeds the integration phase.
+
+## How the work is paced
+
+One push per weekly usage reset. A push builds **two** systems side by side and nothing else; every system is
+finished, checked, committed and pushed inside the same session. Nothing is ever left half-built: a part that
+cannot finish cleanly in one session is split into smaller parts first.
+
+| Push | Work | State |
+| --- | --- | --- |
+| 0 | foundation, combat, fx | done |
+| 1 | world + render | next |
+| 2 | player + enemies-core (manager, skitter, tick, riveter) | |
+| 3 | weapons + enemies-elite (wasp, lancer, bulwark) | |
+| 4 | director + boss (conductor) | |
+| 5 | ui + audio | |
+| 6 | integration: resolve the systems' contract requests and integration notes, full bot campaign without god mode, first playable single-file build | |
+| 7 | review and fix round 1: gameplay / balance, bug hunt | |
+| 8 | review and fix round 2: visuals, UI at several viewport sizes, input fallbacks | |
+| 9 | performance and audio pass, README, final single-file build | |
+
+### Procedure for one push
+
+1. **Prepare the checkout.** `git fetch origin claude/aaa-shooting-game-scratch-d6mlll` and check that branch
+   out (a fresh container starts from a new clone). `npm ci` if `node_modules` is missing. Create the
+   session's scratch directory.
+2. **Baseline gates** (must be green before anything starts): `npx tsc --noEmit`, `npx vitest run`,
+   `npm run build`, `node tools/smoke.mjs --mode dist`.
+3. **Launch the two systems of this push**, each as its own run of `build/sh-build-system.workflow.js` with
+   `args: { key, done: [systems already built], scratch }`. Keys: `world`, `render`, `player`,
+   `enemies-core`, `weapons`, `enemies-elite`, `director`, `boss`, `ui`, `audio`.
+4. **When a system reports back**: save its report as `build/<key>.report.json`, mark it in the tables here,
+   commit and push. A system that returns no report was interrupted: it is the first thing the next push
+   finishes, before anything new starts.
+5. **When both are in**: run all gates on the combined tree (step 2 plus
+   `node tools/campaign.mjs --mode dist --god 1`), fix or record any failure, mark the push done here, commit,
+   push, and stop. Never start a third system in the same push.
 
 ## Not done yet
 

@@ -38,8 +38,6 @@ export interface HitFeedback {
   flush(): void;
   /** Drop everything pending without any feedback. */
   clear(): void;
-  /** Targets waiting for the next flush. */
-  readonly pending: number;
 }
 
 function hitSound(p: Pending): CombatSoundId {
@@ -55,6 +53,8 @@ export function createHitFeedback(ctx: GameContext): HitFeedback {
   const order: Pending[] = [];
   const byTarget = new Map<number, Pending>();
   const free: Pending[] = [];
+  /** Bumped by clear(): tells a running flush that its list is gone. */
+  let epoch = 0;
   const sparkOpts = makeFxOptions();
   const soundOpts = makeSoundOptions();
   const numberOpts: DamageNumberOptions = { crit: false, shield: false, kill: false, targetId: 0 };
@@ -70,9 +70,10 @@ export function createHitFeedback(ctx: GameContext): HitFeedback {
   };
 
   const acquire = (targetId: number): Pending => {
-    const p =
-      free.pop() ??
-      ({ targetId: 0, amount: 0, crit: false, killed: false, shield: true, part: 'shield', weapon: null, point: new THREE.Vector3() } as Pending);
+    let p = free.pop();
+    if (!p) {
+      p = { targetId: 0, amount: 0, crit: false, killed: false, shield: true, part: 'shield', weapon: null, point: new THREE.Vector3() };
+    }
     p.targetId = targetId;
     p.amount = 0;
     p.crit = false;
@@ -83,22 +84,24 @@ export function createHitFeedback(ctx: GameContext): HitFeedback {
     return p;
   };
 
-  /** The spark of one damaging ray: thrown off the struck surface, carried along with a moving victim. */
+  /**
+   * The spark of one damaging ray. `normal` = out of the struck sphere, `dir` = the direction the shot
+   * was travelling (the recipe decides whether its sparks spray back at the shooter or carry on), and
+   * the victim's velocity so the burst stays with a moving machine.
+   */
   const spark = (target: HitTarget, info: Readonly<DamageInfo>, result: Readonly<DamageResult>): void => {
     const o = clearFxOptions(sparkOpts);
     const n = o.normal;
+    const travelling = info.dir.lengthSq() > 1e-10;
     const sphere = info.sphereIndex >= 0 ? (target.spheres[info.sphereIndex] as HitSphere | undefined) : undefined;
     if (sphere) n.subVectors(info.point, sphere.center);
     else n.copy(info.dir).negate();
     const len = n.length();
     if (len > 1e-5 && Number.isFinite(len)) n.multiplyScalar(1 / len);
-    else if (info.dir.lengthSq() > 1e-10) n.copy(info.dir).negate().normalize();
+    else if (travelling) n.copy(info.dir).negate().normalize();
     else n.set(0, 1, 0);
-    // Sparks leave along the reflected shot: a glancing hit sprays on, a square hit sprays back.
-    const along = info.dir.dot(n);
-    o.dir.copy(info.dir).addScaledVector(n, -2 * along);
-    if (!(o.dir.lengthSq() > 1e-10)) o.dir.copy(n);
-    else o.dir.normalize();
+    if (travelling) o.dir.copy(info.dir).normalize();
+    else o.dir.copy(n).negate();
     if (target.enemy) o.velocity.copy(target.enemy.velocity);
     // An absorbed hit reads as a shield hit whatever part it struck, matching the sound of the flush.
     ctx.fx.spawn(result.absorbed ? HIT_FX.shield : HIT_FX[result.part], info.point, o);
@@ -126,8 +129,10 @@ export function createHitFeedback(ctx: GameContext): HitFeedback {
       // Only what is pending NOW: a hit recorded by a listener of this very flush waits for the next one.
       const n = order.length;
       if (n === 0) return;
-      // Several targets in one substep (a rail through a pack, a blast): the clicks must not add up to a bang.
-      const volume = n > 1 ? 1 / Math.sqrt(n) : 1;
+      const flushing = epoch;
+      // Several targets in one substep (a rail through a pack, a blast): the clicks must not add up to a
+      // bang. A kill always stays audible.
+      const volume = Math.pow(n, -0.75);
       for (let i = 0; i < n; i++) {
         const p = order[i] as Pending;
         // Closed before the feedback goes out, so a re-entrant hit on the same target opens a new record.
@@ -141,7 +146,7 @@ export function createHitFeedback(ctx: GameContext): HitFeedback {
           ctx.fx.damageNumber(p.point, p.amount, numberOpts);
         }
 
-        soundOpts.volume = volume;
+        soundOpts.volume = p.killed ? Math.max(volume, 0.6) : volume;
         soundOpts.pitch = 1;
         soundOpts.delay = 0;
         soundOpts.owner = 0;
@@ -157,6 +162,8 @@ export function createHitFeedback(ctx: GameContext): HitFeedback {
         payload.weapon = p.weapon;
         payload.point.copy(p.point);
         ctx.events.emit('hit:confirmed', payload);
+        // A listener reset the game: the list this loop was walking is gone.
+        if (epoch !== flushing) return;
       }
       for (let i = 0; i < n; i++) free.push(order[i] as Pending);
       // Keep whatever arrived during the flush, in order.
@@ -169,10 +176,7 @@ export function createHitFeedback(ctx: GameContext): HitFeedback {
       for (let i = 0; i < order.length; i++) free.push(order[i] as Pending);
       order.length = 0;
       byTarget.clear();
-    },
-
-    get pending(): number {
-      return order.length;
+      epoch++;
     },
   };
 }

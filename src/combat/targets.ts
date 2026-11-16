@@ -1,7 +1,10 @@
 /**
  * Hit-target registry and the ray queries against it: nearest hit, piercing trace, swept sphere
- * (thick ray) and radius query. Pure geometry: nothing here applies damage or plays feedback, and no
- * query allocates.
+ * (thick ray) and radius query. Pure geometry: nothing here applies damage or plays feedback.
+ *
+ * No query allocates — not even a boxed number: an optimised call that is not inlined boxes every
+ * fractional argument and return value, so the inner helpers exchange their numbers through one
+ * Float64Array instead of parameters, and vectors are written field by field.
  */
 import { COL } from '../core/constants';
 import { makeRayHit } from '../core/make';
@@ -19,6 +22,7 @@ import type {
 /**
  * Distance along a ray at which it enters a sphere, or -1 when it misses or enters beyond `limit`.
  * `(dx, dy, dz)` must be unit length. A ray that starts inside the sphere enters at 0.
+ * (The reference formula; the registry's loops carry their own inlined copy.)
  */
 export function raySphere(
   ox: number,
@@ -38,44 +42,19 @@ export function raySphere(
   const mz = cz - oz;
   const along = mx * dx + my * dy + mz * dz;
   const c = mx * mx + my * my + mz * mz - radius * radius;
+  if (c <= 0) return 0;
   // Outside the sphere and heading away from it.
-  if (c > 0 && along < 0) return -1;
+  if (along < 0) return -1;
   const disc = along * along - c;
   if (!(disc >= 0)) return -1;
   const t = along - Math.sqrt(disc);
-  if (t <= 0) return 0;
   return t <= limit ? t : -1;
 }
 
-const ZERO: Vec3Like = { x: 0, y: 0, z: 0 };
-const DOWN: Vec3Like = { x: 0, y: -1, z: 0 };
-
-/** Reset a ShotHit to "nothing within maxDist". */
-export function clearShotHit(out: ShotHit, origin: Vec3Like, dir: Vec3Like, maxDist: number): ShotHit {
-  out.kind = 'none';
-  out.distance = maxDist;
-  out.point.set(origin.x + dir.x * maxDist, origin.y + dir.y * maxDist, origin.z + dir.z * maxDist);
-  out.normal.set(-dir.x, -dir.y, -dir.z);
-  out.target = null;
-  out.part = 'body';
-  out.sphereIndex = -1;
-  out.surface = 'metal';
-  out.boxId = -1;
-  return out;
-}
-
-export function copyShotHit(out: ShotHit, from: ShotHit): ShotHit {
-  out.kind = from.kind;
-  out.distance = from.distance;
-  out.point.copy(from.point);
-  out.normal.copy(from.normal);
-  out.target = from.target;
-  out.part = from.part;
-  out.sphereIndex = from.sphereIndex;
-  out.surface = from.surface;
-  out.boxId = from.boxId;
-  return out;
-}
+/** Slots of TargetRegistry.io. */
+export const IO_LIMIT = 0;
+export const IO_PAD = 1;
+export const IO_DISTANCE = 2;
 
 export interface TargetRegistry {
   /** Registered targets in registration order (alive or not). Never mutate. */
@@ -94,40 +73,18 @@ export interface TargetRegistry {
    */
   refresh(): void;
 
+  /** Number exchange of sweep(): write io[IO_LIMIT] and io[IO_PAD] before, read io[IO_DISTANCE] after. */
+  readonly io: Float64Array;
   /**
-   * Nearest hostile target sphere entered by the ray within `limit`. `pad` thickens the ray for the
-   * target tests. Fills `out` (kind 'target') and returns the distance, or returns -1 and leaves `out`
-   * untouched. `faction` / `ignoreId` as in TraceOptions.
+   * Nearest hostile target sphere entered by the ray within io[IO_LIMIT], the ray thickened by
+   * io[IO_PAD] for the target tests. On a hit fills `out` (kind 'target'), stores the distance in
+   * io[IO_DISTANCE] and returns true; otherwise leaves `out` untouched. `faction` / `ignoreId` as in
+   * TraceOptions; `selfId` is a second id to pass (the hit target of a shootable projectile itself).
    */
-  sweep(
-    origin: Vec3Like,
-    dir: Vec3Like,
-    limit: number,
-    pad: number,
-    faction: Faction,
-    ignoreId: number,
-    out: ShotHit,
-  ): number;
+  sweep(origin: Vec3Like, dir: Vec3Like, faction: Faction, ignoreId: number, selfId: number, out: ShotHit): boolean;
   traceShot(origin: Vec3Like, dir: Vec3Like, maxDist: number, opts: TraceOptions, out: ShotHit): boolean;
   tracePierce(origin: Vec3Like, dir: Vec3Like, maxDist: number, opts: TraceOptions, out: PierceResult): number;
   queryRadius(center: Vec3Like, radius: number, faction: Faction | 'any', out: HitTarget[]): number;
-}
-
-/** Radius around target.center that encloses every sphere (never less than the owner's boundRadius). */
-function measureReach(target: HitTarget): number {
-  let reach = target.boundRadius;
-  const c = target.center;
-  const spheres = target.spheres;
-  for (let i = 0; i < spheres.length; i++) {
-    const s = spheres[i] as HitSphere;
-    const dx = s.center.x - c.x;
-    const dy = s.center.y - c.y;
-    const dz = s.center.z - c.z;
-    const r = Math.sqrt(dx * dx + dy * dy + dz * dz) + s.radius;
-    if (r > reach) reach = r;
-  }
-  // A target whose spheres are not posed yet (or broken) is never culled by the broad phase.
-  return reach >= 0 ? reach : Infinity;
 }
 
 /** `collision` is read lazily: the world fills it after the systems were constructed. */
@@ -137,52 +94,114 @@ export function createTargetRegistry(collision: () => CollisionWorld): TargetReg
   const reach: number[] = [];
   const byId = new Map<number, HitTarget>();
   const rayHit = makeRayHit();
-  /** Sphere index found by the last nearestSphere() call. */
+  const io = new Float64Array(3);
+  /** Sphere index found by the last nearestOf() call. */
   let foundIndex = -1;
 
-  /** Entry distance into the nearest enabled sphere of one target (or -1); the index goes to foundIndex. */
-  const nearestSphere = (
-    target: HitTarget,
-    ox: number,
-    oy: number,
-    oz: number,
-    dx: number,
-    dy: number,
-    dz: number,
-    limit: number,
-    pad: number,
-  ): number => {
+  /**
+   * Measure reach[index]: the radius around the target's centre that encloses every sphere, never less
+   * than the owner's boundRadius. (Written in place: a returned fraction would be boxed.)
+   */
+  const measure = (index: number): void => {
+    const target = list[index] as HitTarget;
+    let r = target.boundRadius;
+    const c = target.center;
+    const spheres = target.spheres;
+    for (let i = 0; i < spheres.length; i++) {
+      const sphere = spheres[i] as HitSphere;
+      const sc = sphere.center;
+      const dx = sc.x - c.x;
+      const dy = sc.y - c.y;
+      const dz = sc.z - c.z;
+      const far = Math.sqrt(dx * dx + dy * dy + dz * dz) + sphere.radius;
+      if (far > r) r = far;
+    }
+    // A target whose spheres are not posed yet (or broken) is never culled by the broad phase.
+    // (A numeric literal on purpose: a fraction that shares a variable with the global `Infinity`, or
+    // with any constant the optimiser has to load, gets boxed.)
+    if (!(r >= 0) || r > 1e12) r = 1e12;
+    reach[index] = r;
+  };
+
+  /**
+   * Entry of the ray into the nearest enabled sphere of list[index] within io[IO_LIMIT]: true when
+   * there is one, with its distance in io[IO_DISTANCE] and its index in foundIndex.
+   */
+  const nearestOf = (index: number, origin: Vec3Like, dir: Vec3Like): boolean => {
+    const target = list[index] as HitTarget;
+    const limit = io[IO_LIMIT] as number;
+    const pad = io[IO_PAD] as number;
+    const ox = origin.x;
+    const oy = origin.y;
+    const oz = origin.z;
+    const dx = dir.x;
+    const dy = dir.y;
+    const dz = dir.z;
+
+    // Broad phase: the sphere that encloses the whole target.
+    const c = target.center;
+    const bound = (reach[index] as number) + pad;
+    let mx = c.x - ox;
+    let my = c.y - oy;
+    let mz = c.z - oz;
+    let along = mx * dx + my * dy + mz * dz;
+    let outside = mx * mx + my * my + mz * mz - bound * bound;
+    if (outside > 0) {
+      if (along < 0) return false;
+      const disc = along * along - outside;
+      if (!(disc >= 0) || along - Math.sqrt(disc) > limit) return false;
+    }
+
     const spheres = target.spheres;
     let best = -1;
+    let bestIndex = -1;
     let bestLimit = limit;
     for (let i = 0; i < spheres.length; i++) {
       const s = spheres[i] as HitSphere;
       if (!s.enabled) continue;
-      const t = raySphere(ox, oy, oz, dx, dy, dz, s.center.x, s.center.y, s.center.z, s.radius + pad, bestLimit);
+      const sc = s.center;
+      const r = s.radius + pad;
+      mx = sc.x - ox;
+      my = sc.y - oy;
+      mz = sc.z - oz;
+      along = mx * dx + my * dy + mz * dz;
+      outside = mx * mx + my * my + mz * mz - r * r;
+      let t = 0;
+      if (outside > 0) {
+        if (along < 0) continue;
+        const disc = along * along - outside;
+        if (!(disc >= 0)) continue;
+        t = along - Math.sqrt(disc);
+        if (t > bestLimit) continue;
+      }
       // Strictly nearer only: of two spheres entered at the same distance the first one listed wins.
-      if (t < 0 || (best >= 0 && t >= best)) continue;
+      if (bestIndex >= 0 && t >= best) continue;
       best = t;
       bestLimit = t;
-      foundIndex = i;
+      bestIndex = i;
     }
-    return best;
+    if (bestIndex < 0) return false;
+    io[IO_DISTANCE] = best;
+    foundIndex = bestIndex;
+    return true;
   };
 
-  const fillTargetHit = (
-    out: ShotHit,
-    target: HitTarget,
-    sphereIndex: number,
-    t: number,
-    origin: Vec3Like,
-    dir: Vec3Like,
-    pad: number,
-  ): void => {
+  const isHostile = (target: HitTarget, faction: Faction, ignoreId: number): boolean =>
+    target.alive && target.id !== ignoreId && (faction === 'neutral' || target.faction !== faction);
+
+  /** Write a target hit at io[IO_DISTANCE] on sphere `sphereIndex` into `out`. */
+  const fillTargetHit = (out: ShotHit, target: HitTarget, sphereIndex: number, origin: Vec3Like, dir: Vec3Like): void => {
+    const t = io[IO_DISTANCE] as number;
+    const pad = io[IO_PAD] as number;
     const sphere = target.spheres[sphereIndex] as HitSphere;
     const c = sphere.center;
     // Where the ray is when it touches the (possibly thickened) sphere.
-    let nx = origin.x + dir.x * t - c.x;
-    let ny = origin.y + dir.y * t - c.y;
-    let nz = origin.z + dir.z * t - c.z;
+    const px = origin.x + dir.x * t;
+    const py = origin.y + dir.y * t;
+    const pz = origin.z + dir.z * t;
+    let nx = px - c.x;
+    let ny = py - c.y;
+    let nz = pz - c.z;
     const len = Math.sqrt(nx * nx + ny * ny + nz * nz);
     if (len > 1e-6) {
       nx /= len;
@@ -200,75 +219,91 @@ export function createTargetRegistry(collision: () => CollisionWorld): TargetReg
     out.sphereIndex = sphereIndex;
     out.surface = 'metal';
     out.boxId = -1;
-    out.normal.set(nx, ny, nz);
+    const normal = out.normal;
+    normal.x = nx;
+    normal.y = ny;
+    normal.z = nz;
+    const point = out.point;
     if (pad > 0 && len > sphere.radius) {
       // A thick ray touches the real surface at the point nearest to its axis: that is where the hit is.
-      out.point.set(c.x + nx * sphere.radius, c.y + ny * sphere.radius, c.z + nz * sphere.radius);
+      point.x = c.x + nx * sphere.radius;
+      point.y = c.y + ny * sphere.radius;
+      point.z = c.z + nz * sphere.radius;
     } else {
-      out.point.set(origin.x + dir.x * t, origin.y + dir.y * t, origin.z + dir.z * t);
+      point.x = px;
+      point.y = py;
+      point.z = pz;
     }
   };
 
-  const isHostile = (target: HitTarget, faction: Faction, ignoreId: number): boolean =>
-    target.alive && target.id !== ignoreId && (faction === 'neutral' || target.faction !== faction);
-
-  const sweep = (
-    origin: Vec3Like,
-    dir: Vec3Like,
-    limit: number,
-    pad: number,
-    faction: Faction,
-    ignoreId: number,
-    out: ShotHit,
-  ): number => {
-    const ox = origin.x;
-    const oy = origin.y;
-    const oz = origin.z;
-    const dx = dir.x;
-    const dy = dir.y;
-    const dz = dir.z;
-    let best = -1;
-    let bestLimit = limit;
+  const sweep = (origin: Vec3Like, dir: Vec3Like, faction: Faction, ignoreId: number, selfId: number, out: ShotHit): boolean => {
     let bestTarget: HitTarget | null = null;
     let bestIndex = -1;
     for (let i = 0; i < list.length; i++) {
       const target = list[i] as HitTarget;
-      if (!isHostile(target, faction, ignoreId)) continue;
-      const c = target.center;
-      if (raySphere(ox, oy, oz, dx, dy, dz, c.x, c.y, c.z, (reach[i] as number) + pad, bestLimit) < 0) continue;
-      const t = nearestSphere(target, ox, oy, oz, dx, dy, dz, bestLimit, pad);
+      if (target.id === selfId || !isHostile(target, faction, ignoreId)) continue;
+      if (!nearestOf(i, origin, dir)) continue;
+      const t = io[IO_DISTANCE] as number;
       // Of two targets entered at the same distance the one registered first wins.
-      if (t < 0 || (best >= 0 && t >= best)) continue;
-      best = t;
-      bestLimit = t;
+      if (bestTarget && t >= (io[IO_LIMIT] as number)) continue;
       bestTarget = target;
       bestIndex = foundIndex;
+      io[IO_LIMIT] = t;
     }
-    if (bestTarget) fillTargetHit(out, bestTarget, bestIndex, best, origin, dir, pad);
-    return best;
+    if (!bestTarget) return false;
+    io[IO_DISTANCE] = io[IO_LIMIT] as number;
+    fillTargetHit(out, bestTarget, bestIndex, origin, dir);
+    return true;
   };
 
   /** A ray the queries can work with: finite origin and direction, a positive finite length. */
   const validRay = (origin: Vec3Like, dir: Vec3Like, maxDist: number): boolean =>
     maxDist > 0 && Number.isFinite(maxDist + origin.x + origin.y + origin.z + dir.x + dir.y + dir.z);
-  /** The answer to a broken ray: nothing, at the origin (or at zero when even that is not a point). */
-  const clearInvalid = (out: ShotHit, origin: Vec3Like): void => {
-    clearShotHit(out, ZERO, DOWN, 0);
-    if (Number.isFinite(origin.x + origin.y + origin.z)) out.point.set(origin.x, origin.y, origin.z);
+
+  /** `out` = nothing within `maxDist` (a broken ray: nothing at the origin, or at zero when even that is no point). */
+  const clearShot = (out: ShotHit, origin: Vec3Like, dir: Vec3Like, maxDist: number, valid: boolean): void => {
+    out.kind = 'none';
+    out.target = null;
+    out.part = 'body';
+    out.sphereIndex = -1;
+    out.surface = 'metal';
+    out.boxId = -1;
+    const point = out.point;
+    const normal = out.normal;
+    if (valid) {
+      out.distance = maxDist;
+      point.x = origin.x + dir.x * maxDist;
+      point.y = origin.y + dir.y * maxDist;
+      point.z = origin.z + dir.z * maxDist;
+      normal.x = -dir.x;
+      normal.y = -dir.y;
+      normal.z = -dir.z;
+    } else {
+      const finite = Number.isFinite(origin.x + origin.y + origin.z);
+      out.distance = 0;
+      point.x = finite ? origin.x : 0;
+      point.y = finite ? origin.y : 0;
+      point.z = finite ? origin.z : 0;
+      normal.x = 0;
+      normal.y = 1;
+      normal.z = 0;
+    }
   };
 
   const registry: TargetRegistry = {
     list,
+    io,
     register(target: HitTarget): void {
       const existing = byId.get(target.id);
       if (existing) {
         // Same id again: the new entry takes the place (and the order) of the previous one.
         const i = list.indexOf(existing);
         list[i] = target;
-        reach[i] = measureReach(target);
+        measure(i);
       } else {
         list.push(target);
-        reach.push(measureReach(target));
+        reach.push(0.5);
+        measure(list.length - 1);
       }
       byId.set(target.id, target);
     },
@@ -294,27 +329,26 @@ export function createTargetRegistry(collision: () => CollisionWorld): TargetReg
       byId.clear();
     },
     refresh(): void {
-      for (let i = 0; i < list.length; i++) reach[i] = measureReach(list[i] as HitTarget);
+      for (let i = 0; i < list.length; i++) measure(i);
     },
     sweep,
 
     traceShot(origin: Vec3Like, dir: Vec3Like, maxDist: number, opts: TraceOptions, out: ShotHit): boolean {
-      if (!validRay(origin, dir, maxDist)) {
-        clearInvalid(out, origin);
-        return false;
-      }
-      clearShotHit(out, origin, dir, maxDist);
+      const valid = validRay(origin, dir, maxDist);
+      clearShot(out, origin, dir, maxDist, valid);
+      if (!valid) return false;
       const mask = opts.worldMask ?? COL.PROJECTILE;
-      let limit = maxDist;
+      io[IO_LIMIT] = maxDist;
       if (mask !== 0 && collision().raycast(origin, dir, maxDist, mask, rayHit)) {
+        io[IO_LIMIT] = out.distance = rayHit.distance;
         out.kind = 'world';
-        out.distance = limit = rayHit.distance;
         out.point.copy(rayHit.point);
         out.normal.copy(rayHit.normal);
         out.surface = rayHit.surface;
         out.boxId = rayHit.boxId;
       }
-      sweep(origin, dir, limit, opts.radius ?? 0, opts.faction, opts.ignoreId ?? 0, out);
+      io[IO_PAD] = opts.radius ?? 0;
+      sweep(origin, dir, opts.faction, opts.ignoreId ?? 0, 0, out);
       return out.kind !== 'none';
     },
 
@@ -323,50 +357,56 @@ export function createTargetRegistry(collision: () => CollisionWorld): TargetReg
       out.hitWorld = false;
       out.boxId = -1;
       out.surface = 'metal';
+      const end = out.end;
+      const endNormal = out.endNormal;
       if (!validRay(origin, dir, maxDist)) {
-        out.endNormal.set(0, 1, 0);
-        if (Number.isFinite(origin.x + origin.y + origin.z)) out.end.set(origin.x, origin.y, origin.z);
-        else out.end.set(0, 0, 0);
+        const finite = Number.isFinite(origin.x + origin.y + origin.z);
+        end.x = finite ? origin.x : 0;
+        end.y = finite ? origin.y : 0;
+        end.z = finite ? origin.z : 0;
+        endNormal.x = 0;
+        endNormal.y = 1;
+        endNormal.z = 0;
         return 0;
       }
-      out.endNormal.set(-dir.x, -dir.y, -dir.z);
       const mask = opts.worldMask ?? COL.PROJECTILE;
-      let limit = maxDist;
+      io[IO_LIMIT] = maxDist;
       if (mask !== 0 && collision().raycast(origin, dir, maxDist, mask, rayHit)) {
-        limit = rayHit.distance;
+        io[IO_LIMIT] = rayHit.distance;
         out.hitWorld = true;
         out.boxId = rayHit.boxId;
         out.surface = rayHit.surface;
-        out.endNormal.copy(rayHit.normal);
+        endNormal.copy(rayHit.normal);
+        end.copy(rayHit.point);
+      } else {
+        end.x = origin.x + dir.x * maxDist;
+        end.y = origin.y + dir.y * maxDist;
+        end.z = origin.z + dir.z * maxDist;
+        endNormal.x = -dir.x;
+        endNormal.y = -dir.y;
+        endNormal.z = -dir.z;
       }
-      out.end.set(origin.x + dir.x * limit, origin.y + dir.y * limit, origin.z + dir.z * limit);
+      io[IO_PAD] = opts.radius ?? 0;
 
       const hits = out.hits;
       const capacity = hits.length;
       if (capacity === 0) return 0;
-      const pad = opts.radius ?? 0;
       const ignoreId = opts.ignoreId ?? 0;
-      const ox = origin.x;
-      const oy = origin.y;
-      const oz = origin.z;
+      const faction = opts.faction;
       let count = 0;
       for (let i = 0; i < list.length; i++) {
         const target = list[i] as HitTarget;
-        if (!isHostile(target, opts.faction, ignoreId)) continue;
-        const c = target.center;
-        if (raySphere(ox, oy, oz, dir.x, dir.y, dir.z, c.x, c.y, c.z, (reach[i] as number) + pad, limit) < 0) continue;
-        const t = nearestSphere(target, ox, oy, oz, dir.x, dir.y, dir.z, limit, pad);
-        if (t < 0) continue;
+        if (!isHostile(target, faction, ignoreId) || !nearestOf(i, origin, dir)) continue;
         let slot: number;
         if (count < capacity) {
           slot = count++;
-        } else if (t < (hits[capacity - 1] as ShotHit).distance) {
+        } else if ((io[IO_DISTANCE] as number) < (hits[capacity - 1] as ShotHit).distance) {
           // More targets on the line than the result can hold: the farthest one gives way.
           slot = capacity - 1;
         } else {
           continue;
         }
-        fillTargetHit(hits[slot] as ShotHit, target, foundIndex, t, origin, dir, pad);
+        fillTargetHit(hits[slot] as ShotHit, target, foundIndex, origin, dir);
         // Insertion sort by distance; equal distances keep registration order.
         for (let j = slot; j > 0 && (hits[j] as ShotHit).distance < (hits[j - 1] as ShotHit).distance; j--) {
           const swap = hits[j] as ShotHit;

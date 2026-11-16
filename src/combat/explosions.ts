@@ -58,7 +58,6 @@ export interface ExplosionQueue {
   resolve(): number;
   /** Forget every queued blast. */
   clear(): void;
-  readonly pending: number;
 }
 
 const UP: Vec3Like = { x: 0, y: 1, z: 0 };
@@ -144,9 +143,9 @@ export function createExplosionQueue(
   const sample = new THREE.Vector3();
   const surfacePoint = new THREE.Vector3();
   const surfaceNormal = new THREE.Vector3();
-  const groundPoint = new THREE.Vector3();
   const lightPoint = new THREE.Vector3();
   const probeFrom = new THREE.Vector3();
+  const probeDir = new THREE.Vector3();
 
   const grow = (): void => {
     const next: Blast[] = [];
@@ -161,11 +160,12 @@ export function createExplosionQueue(
    * share of the player caught in his own blast.
    */
   const share = (b: Blast, target: HitTarget): number => {
-    if (b.faction === 'neutral') return 1;
-    if (target.faction !== b.faction) return 1;
-    if (b.faction === 'player') return b.selfDamageMul > 0 ? b.selfDamageMul : 0;
-    // An enemy blast among enemies: only with friendly fire, and never its own instigator.
-    return b.friendlyFire && target.id !== b.ownerId ? 1 : 0;
+    // An enemy instigator never damages itself, whatever faction its blast was filed under.
+    if (target.id === b.ownerId && target.faction !== 'player') return 0;
+    if (b.faction === 'neutral' || target.faction !== b.faction) return 1;
+    if (b.faction === 'player') return b.selfDamageMul;
+    // An enemy blast among enemies: only with friendly fire.
+    return b.friendlyFire ? 1 : 0;
   };
 
   /** Is any part of the target exposed to the blast (not behind solid cover)? */
@@ -179,6 +179,8 @@ export function createExplosionQueue(
   };
 
   const dealDamage = (b: Blast): void => {
+    // A blast without damage and without push is presentation only (a projectile that was shot down).
+    if (b.damage <= 0 && b.knockback <= 0) return;
     const list = registry.list;
     const p = b.position;
     // Snapshot first: a victim that dies unregisters itself (and may queue the next blast) mid-loop.
@@ -229,15 +231,18 @@ export function createExplosionQueue(
       // Falloff is measured to the bounding sphere, so big targets are not short-changed.
       const d = Math.max(0, dist - target.boundRadius);
       const k = 1 - (1 - b.edgeFalloff) * clamp01(d / b.radius);
+      const amount = b.damage * k * (victimScale[i] as number);
+      const knockback = b.knockback * k;
+      if (amount <= 0 && knockback <= 0) continue;
       clearDamageInfo(info);
-      info.amount = b.damage * k * (victimScale[i] as number);
+      info.amount = amount;
       info.type = b.type;
       info.faction = b.faction;
       info.sourceId = b.ownerId;
       info.weapon = b.weapon;
       info.splash = true;
       info.creditPlayer = b.creditPlayer;
-      info.knockback = b.knockback * k;
+      info.knockback = knockback;
       info.dir.set(dx, dy, dz);
       // The side of the victim that faces the blast.
       const inset = Math.min(target.boundRadius * 0.5, dist);
@@ -254,7 +259,8 @@ export function createExplosionQueue(
     if (b.surfaceBoxId >= 0) {
       surfaceNormal.copy(b.surfaceNormal);
       // The blast sits a hair off the surface it burst on.
-      if (collision.raycast(p, probeFrom.copy(surfaceNormal).negate(), 0.5, COL.PROJECTILE, rayHit)) surfacePoint.copy(rayHit.point);
+      probeDir.copy(surfaceNormal).negate();
+      if (collision.raycast(p, probeDir, 0.5, COL.PROJECTILE, rayHit)) surfacePoint.copy(rayHit.point);
       else surfacePoint.copy(p);
       return b.surfaceBoxId;
     }
@@ -299,23 +305,19 @@ export function createExplosionQueue(
     if (b.tint !== 0) o.color = b.tint;
     fx.spawn(look.fx, p, o);
 
-    if (look.ring) {
-      let ground = false;
-      if (onSurface && surfaceNormal.y > 0.7) {
-        groundPoint.copy(surfacePoint);
-        ground = true;
-      } else {
-        probeFrom.set(p.x, p.y + 0.05, p.z);
-        if (ctx.collision.raycast(probeFrom, DOWN, reach + 0.05, COL.PROJECTILE, rayHit)) {
-          groundPoint.copy(rayHit.point);
-          ground = true;
-        }
-      }
-      if (ground) {
+    // The recipe draws its own ring where it bursts. A burst in the air whose blast still reaches the
+    // floor gets the ground ring on top: that is where the damage arrives down there.
+    if (look.ring && !(onSurface && surfaceNormal.y > 0.7)) {
+      probeFrom.set(p.x, p.y + 0.05, p.z);
+      const drop = b.radius * BLAST_FEEL.ringMaxHeight;
+      if (
+        ctx.collision.raycast(probeFrom, DOWN, drop + 0.05, COL.PROJECTILE, rayHit) &&
+        rayHit.distance - 0.05 >= b.radius * BLAST_FEEL.ringMinHeight
+      ) {
         const ring = clearFxOptions(fxOpts);
         ring.radius = b.radius;
         if (b.tint !== 0) ring.color = b.tint;
-        fx.spawn('shockwaveRing', groundPoint, ring);
+        fx.spawn('shockwaveRing', rayHit.point, ring);
       }
     }
     if (onSurface) {
@@ -372,25 +374,27 @@ export function createExplosionQueue(
       const { x, y, z } = opts.position;
       const radius = opts.radius;
       const damage = opts.damage;
-      if (!Number.isFinite(x + y + z) || !(radius > 0) || !Number.isFinite(radius) || !(damage >= 0) || !Number.isFinite(damage)) {
-        return false;
-      }
+      const valid = Number.isFinite(x + y + z) && radius > 0 && Number.isFinite(radius) && damage >= 0 && Number.isFinite(damage);
+      if (!valid) return false;
       if (count === ring.length) grow();
       const b = ring[(head + count) % ring.length] as Blast;
       count++;
       b.position.set(x, y, z);
       b.radius = radius;
       b.damage = damage;
-      b.edgeFalloff = clamp01(opts.edgeFalloff ?? BLAST_DEFAULTS.edgeFalloff);
+      const edge = opts.edgeFalloff ?? BLAST_DEFAULTS.edgeFalloff;
+      b.edgeFalloff = Number.isFinite(edge) ? clamp01(edge) : BLAST_DEFAULTS.edgeFalloff;
       b.faction = opts.faction;
       b.ownerId = opts.ownerId ?? 0;
       b.excludeId = opts.excludeId ?? 0;
-      b.selfDamageMul = Math.max(0, opts.selfDamageMul ?? BLAST_DEFAULTS.selfDamageMul);
+      const self = opts.selfDamageMul ?? BLAST_DEFAULTS.selfDamageMul;
+      b.selfDamageMul = self > 0 && Number.isFinite(self) ? self : 0;
       b.friendlyFire = opts.friendlyFire ?? false;
       b.creditPlayer = opts.creditPlayer ?? false;
       b.type = opts.type ?? 'explosion';
       b.weapon = opts.weapon ?? null;
-      b.knockback = opts.knockback ?? BLAST_DEFAULTS.knockback;
+      const knockback = opts.knockback ?? BLAST_DEFAULTS.knockback;
+      b.knockback = knockback >= 0 && Number.isFinite(knockback) ? knockback : 0;
       b.lineOfSight = opts.lineOfSight ?? true;
       b.visual = opts.visual ?? (radius < BLAST_DEFAULTS.largeFromRadius ? 'small' : 'large');
       if (normal && boxId >= 0) {
@@ -422,11 +426,8 @@ export function createExplosionQueue(
     clear(): void {
       head = 0;
       count = 0;
+      // Also ends the damage loop of a blast that is being resolved right now.
       victims.length = 0;
-    },
-
-    get pending(): number {
-      return count;
     },
   };
 }

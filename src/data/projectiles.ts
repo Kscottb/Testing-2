@@ -11,13 +11,13 @@ export const PROJECTILES: Readonly<Record<ProjectileKind, ProjectileDef>> = {
   /** Frag grenade (player): bounces until its fuse ends. */
   grenade: { kind: 'grenade', radius: 0.12, type: 'explosion', trail: 'grenade', loop: null, visual: 'large', shootable: false },
   /** Riveter burst bolt. */
-  plasmaBolt: { kind: 'plasmaBolt', radius: 0.2, type: 'plasma', trail: 'plasma', loop: null, visual: 'plasma', shootable: false },
+  plasmaBolt: { kind: 'plasmaBolt', radius: 0.16, type: 'plasma', trail: 'plasma', loop: null, visual: 'plasma', shootable: false },
   /** Wasp rapid light bolt. */
-  lightBolt: { kind: 'lightBolt', radius: 0.12, type: 'plasma', trail: 'bolt', loop: null, visual: 'none', shootable: false },
+  lightBolt: { kind: 'lightBolt', radius: 0.1, type: 'plasma', trail: 'bolt', loop: null, visual: 'none', shootable: false },
   /** Bulwark lobbed shell (pass gravity + landingTelegraph). */
   mortar: { kind: 'mortar', radius: 0.3, type: 'explosion', trail: 'mortar', loop: 'mortarLoop', visual: 'large', shootable: false },
   /** Conductor volley bolt. */
-  bossBolt: { kind: 'bossBolt', radius: 0.3, type: 'plasma', trail: 'bossBolt', loop: null, visual: 'plasma', shootable: false },
+  bossBolt: { kind: 'bossBolt', radius: 0.26, type: 'plasma', trail: 'bossBolt', loop: null, visual: 'plasma', shootable: false },
   /** Conductor homing missile: the player can shoot it down. */
   bossMissile: { kind: 'bossMissile', radius: 0.35, type: 'explosion', trail: 'missile', loop: 'missileLoop', visual: 'small', shootable: true },
 };

@@ -79,7 +79,7 @@ export interface BlastLook {
   /** Scorch kind left on the nearest surface, and its size as a fraction of the damage radius. */
   decal: DecalKind;
   decalScale: number;
-  /** Also spawn 'shockwaveRing' on the floor when the blast is near it. */
+  /** Add 'shockwaveRing' on the floor below a burst in the air (see BLAST_FEEL.ringMinHeight). */
   ring: boolean;
   /** Pooled light: colour (0 = by faction accent), normalised intensity, reach as a multiple of the radius, seconds. */
   lightColor: number;
@@ -158,7 +158,7 @@ export const BLAST_LOOKS: Readonly<Record<Exclude<ExplosionVisual, 'none'>, Blas
     rumbleSeconds: 0.12,
     chroma: 0.45,
     flash: 0.12,
-    flashColor: 0,
+    flashColor: FIRE_FLASH_COLOR,
     hitstop: 0,
     priority: 2,
   },
@@ -219,9 +219,16 @@ export const BLAST_FEEL = {
   hitstopFrom: 0.35,
   /** Screen flash only above this closeness. */
   flashFrom: 0.12,
-  /** How far below a blast the floor may be for the ground ring and the scorch. */
+  /** How far a surface may be from a blast to take its scorch (fraction of the radius, capped). */
   groundReachScale: 0.5,
   groundReachMax: 2.5,
+  /**
+   * The explosion recipes draw their own ring where they burst (on the floor when that is within 0.4
+   * radii). 'shockwaveRing' is the ground ring of a burst HIGHER than that whose blast still reaches the
+   * floor: height above the floor between these two fractions of the radius.
+   */
+  ringMinHeight: 0.4,
+  ringMaxHeight: 0.75,
   /** Decal size clamp in metres. */
   decalMin: 0.6,
   decalMax: 5,
@@ -229,17 +236,11 @@ export const BLAST_FEEL = {
   sightLift: 0.5,
 } as const;
 
-/** The burst of a projectile that was shot down (harmless: no damage is dealt). */
-export const SHOOTDOWN = {
-  fxRadius: 1.4,
-  volume: 0.7,
-  pitch: 1.25,
-  lightIntensity: 1.6,
-  lightRadius: 6,
-  lightSeconds: 0.2,
-  trauma: 0.12,
-  shakeRadius: 10,
-} as const;
+/**
+ * A projectile that was shot down goes off as a blast of this radius WITHOUT damage or push: the
+ * 'small' package sized to it, nothing more.
+ */
+export const SHOOTDOWN = { radius: 1.4 } as const;
 
 /** Hit spark per part struck (CombatFxId hitEnemy*). */
 export const HIT_FX: Readonly<Record<HitPart, CombatFxId>> = {
